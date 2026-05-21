@@ -9,14 +9,17 @@ Dependencies: watchdog, pyodbc, pywin32, pythoncom, pystray, Pillow, psutil
 """
 
 import os
-import pythoncom
+import sys
+import time
 import queue
 import shutil
-import sys
-import threading
-import time
 import ctypes
 import logging
+import threading
+import pythoncom
+import configparser
+import tkinter as tk
+from tkinter import filedialog, simpledialog, messagebox
 from datetime import datetime
 from pathlib import Path
 from watchdog.observers.polling import PollingObserver as Observer
@@ -46,46 +49,7 @@ import win32event
 import winerror
 import psutil
 
-#  Configuration
-BOX_NAME    = "Studiovision"
-
-STUDIO_VISION_EXE = "studiovision.exe"
-
-SOURCE_DIR  = Path(r"??")
-ORPHAN_DIR  = Path(r"??")
-DEST_PHOTOS = Path(r"??")
-PUBLIC_MDB  = Path(r"??")
-
-WATCHED_EXTENSIONS = {".jpg", ".jpeg", ".jfif", ".png", ".bmp", ".tif", ".tiff", ".dcm", ".pdf", ".rtf", ".doc", ".docx", ".odt", ".xps", ".html"}
-FILE_LOCK_RETRY_DELAY  = 3
-FILE_LOCK_MAX_ATTEMPTS = 15
-PATIENT_POLL_INTERVAL  = 3
-PATIENT_WAIT_TIMEOUT   = 900
-
-ACCESS_FIELD_CODE   = "Code patient"
-ACCESS_FIELD_NOM    = "NOM"
-ACCESS_FIELD_PRENOM = "Prénom"
-
-SFDOC_SUBFORM_NAME = "SFDoc"
-
-EXAM_DESCRIPTION = {
-    ".jpg":  "Image",
-    ".jpeg": "Image",
-    ".jfif": "Image",
-    ".png":  "Image",
-    ".bmp":  "Image",
-    ".tif":  "OCT",
-    ".tiff": "OCT",
-    ".dcm":  "DICOM",
-    ".pdf":  "Document",
-    ".rtf":  "Document",
-    ".doc":  "Document",
-    ".docx": "Document",
-    ".odt":  "Document",
-    ".xps":  "Document",
-    ".html": "Document",
-}
-
+# --- INITIALISATION DES LOGS ---
 _LOG_DIR  = Path(os.path.expanduser("~")) / "studiovision"
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
 _LOG_FILE = _LOG_DIR / "image_router.log"
@@ -101,30 +65,117 @@ logging.basicConfig(
 )
 log = logging.getLogger("image_router")
 
-_NETWORK_SHARE_POLL = 10
+# --- INTERFACE DE CONFIGURATION (INSTALLATION) ---
+def configurer_via_interface(config_path: Path):
+    """Ouvre l'interface Windows pour la première configuration."""
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
 
-# System tray
+    messagebox.showinfo(
+        "Installation du Routeur", 
+        "Première utilisation détectée.\nNous allons configurer les dossiers ensemble."
+    )
+
+    box_name = simpledialog.askstring("Nom du poste", "Comment s'appelle ce poste ? (ex: Box 1) :")
+    if not box_name:
+        box_name = "StudioVision Monitor"
+
+    default_exam_name = simpledialog.askstring(
+        "Nom de l'examen", 
+        "Quel nom par défaut donner aux examens venant de cette machine ?\n(ex: OCT, Rétinophoto, Champ Visuel) :"
+    )
+    if not default_exam_name:
+        default_exam_name = "Image"
+
+    messagebox.showinfo("Étape 1/4", "Sélectionnez le dossier SOURCE\n(Là où les machines envoient les images)")
+    source_dir = filedialog.askdirectory(title="Dossier SOURCE")
+    orphan_dir = str(Path(source_dir) / "Orphelins") if source_dir else ""
+
+    messagebox.showinfo("Étape 2/4", "Sélectionnez le dossier DESTINATION\n(Le dossier Photos de StudioVision)")
+    dest_photos = filedialog.askdirectory(title="Dossier DESTINATION")
+
+    messagebox.showinfo("Étape 3/4", "Sélectionnez la base de données PUBLIC.MDB")
+    public_mdb = filedialog.askopenfilename(
+        title="Sélectionner PUBLIC.MDB", 
+        filetypes=[("Fichiers Access", "*.mdb;*.accdb")]
+    )
+
+    messagebox.showinfo("Étape 4/4", "Sélectionnez la base de données DOCUM.MDB")
+    docum_mdb = filedialog.askopenfilename(
+        title="Sélectionner DOCUM.MDB", 
+        filetypes=[("Fichiers Access", "*.mdb;*.accdb")]
+    )
+
+    if not all([source_dir, dest_photos, public_mdb, docum_mdb]):
+        messagebox.showerror("Erreur", "Configuration incomplète. L'application va se fermer.")
+        sys.exit(1)
+
+    # Création du fichier config.ini
+    cfg = configparser.ConfigParser()
+    cfg["GENERAL"] = {
+        "BOX_NAME": box_name,
+        "DEFAULT_EXAM_NAME": default_exam_name
+    }
+    cfg["PATHS"] = {
+        "SOURCE_DIR": source_dir,
+        "ORPHAN_DIR": orphan_dir,
+        "DEST_PHOTOS": dest_photos,
+        "PUBLIC_MDB": public_mdb,
+        "DOCUM_MDB": docum_mdb
+    }
+    cfg["TIMEOUTS"] = {"PATIENT_WAIT_TIMEOUT": "900"}
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        cfg.write(f)
+    
+    messagebox.showinfo("Terminé", "Configuration sauvegardée avec succès !\nLe routeur va maintenant démarrer en arrière-plan.")
+    root.destroy()
+
+_config_path = Path(__file__).parent / "config.ini"
+
+if not _config_path.exists():
+    configurer_via_interface(_config_path)
+
+config = configparser.ConfigParser()
+config.read(_config_path, encoding='utf-8')
+
+BOX_NAME          = config.get("GENERAL", "BOX_NAME", fallback="StudioVision Monitor")
+DEFAULT_EXAM_NAME = config.get("GENERAL", "DEFAULT_EXAM_NAME", fallback="Image")
+SOURCE_DIR        = Path(config.get("PATHS", "SOURCE_DIR"))
+ORPHAN_DIR        = Path(config.get("PATHS", "ORPHAN_DIR"))
+DEST_PHOTOS       = Path(config.get("PATHS", "DEST_PHOTOS"))
+PUBLIC_MDB        = Path(config.get("PATHS", "PUBLIC_MDB"))
+DOCUM_MDB         = Path(config.get("PATHS", "DOCUM_MDB"))
+PATIENT_WAIT_TIMEOUT = config.getint("TIMEOUTS", "PATIENT_WAIT_TIMEOUT", fallback=900)
+
+STUDIO_VISION_EXE      = "studiovision.exe"
+WATCHED_EXTENSIONS     = {".jpg", ".jpeg", ".jfif", ".png", ".bmp", ".tif", ".tiff", ".dcm", ".pdf", ".rtf", ".doc", ".docx", ".odt", ".xps", ".html"}
+FILE_LOCK_RETRY_DELAY  = 3
+FILE_LOCK_MAX_ATTEMPTS = 15
+PATIENT_POLL_INTERVAL  = 3
+_NETWORK_SHARE_POLL    = 10
+
+ACCESS_FIELD_CODE   = "Code patient"
+ACCESS_FIELD_NOM    = "NOM"
+ACCESS_FIELD_PRENOM = "Prénom"
+SFDOC_SUBFORM_NAME  = "SFDoc"
+
 _ICON_SIZE     = 64
-_COLOR_READY   = (30, 144, 255)   # dodger blue
-_COLOR_ACTIVE  = (50, 205, 50)    # lime green
+_COLOR_READY   = (30, 144, 255)
+_COLOR_ACTIVE  = (50, 205, 50)
 
 _icon: "pystray.Icon | None" = None
 _status_text: str             = "Starting..."
 _stop_event: threading.Event  = threading.Event()
-
 _mutex_handle = None
-
 
 def _make_icon(color: tuple) -> "Image.Image":
     img  = Image.new("RGBA", (_ICON_SIZE, _ICON_SIZE), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     margin = 4
-    draw.ellipse(
-        [margin, margin, _ICON_SIZE - margin, _ICON_SIZE - margin],
-        fill=color,
-    )
+    draw.ellipse([margin, margin, _ICON_SIZE - margin, _ICON_SIZE - margin], fill=color)
     return img
-
 
 def _set_status(text: str, processing: bool = False) -> None:
     global _status_text
@@ -383,14 +434,14 @@ def refresh_ui(expected_patient_code: str | None = None) -> None:
 def wait_for_file(file: Path) -> bool:
     for attempt in range(1, FILE_LOCK_MAX_ATTEMPTS + 1):
         try:
-            with file.open("rb"):
+            with file.open("ab"):
                 return True
         except (PermissionError, OSError):
-            log.debug(f"File locked ({attempt}/{FILE_LOCK_MAX_ATTEMPTS}), retrying...")
+            log.debug(f"Fichier verrouillé ({attempt}/{FILE_LOCK_MAX_ATTEMPTS}), retrying...")
             time.sleep(FILE_LOCK_RETRY_DELAY)
-    log.error(f"File still locked after {FILE_LOCK_MAX_ATTEMPTS} attempts: {file}")
+            
+    log.error(f"Fichier toujours verrouillé après {FILE_LOCK_MAX_ATTEMPTS} tentatives: {file}")
     return False
-
 
 def move_file(source: Path, dest_folder: Path, label: str = "") -> Path | None:
     dest_folder.mkdir(parents=True, exist_ok=True)
@@ -522,7 +573,8 @@ def worker(file_queue: queue.Queue) -> None:
 
             group_name    = patient_folder.parent.name
             relative_path = f"\\{group_name}\\{patient_folder.name}\\{dest.name}"
-            description   = EXAM_DESCRIPTION.get(file.suffix.lower(), "Image")
+            
+            description = DEFAULT_EXAM_NAME
 
             if insert_document(patient, relative_path, description):
                 needs_refresh     = True
