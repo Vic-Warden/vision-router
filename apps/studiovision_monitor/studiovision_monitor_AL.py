@@ -16,6 +16,7 @@ import shutil
 import ctypes
 import logging
 import threading
+import subprocess
 import pythoncom
 import configparser
 import tkinter as tk
@@ -65,72 +66,204 @@ logging.basicConfig(
 )
 log = logging.getLogger("image_router")
 
-# --- INTERFACE DE CONFIGURATION (INSTALLATION) ---
-def configurer_via_interface(config_path: Path):
-    """Ouvre l'interface Windows pour la première configuration."""
+# ---------------------------------------------------------------------------
+#  HELPERS DE CONFIGURATION AUTOMATIQUE
+# ---------------------------------------------------------------------------
+
+def get_db_path_from_com() -> "Path | None":
+    """
+    Retourne le chemin complet de la base de données actuellement ouverte
+    dans l'instance active de Microsoft Access (via COM).
+    En pratique, cela correspond à PUBLIC.MDB dans Studio Vision.
+    """
+    if not WIN32_AVAILABLE:
+        log.error("win32com non disponible — détection COM impossible.")
+        return None
+    try:
+        access   = win32com.client.GetActiveObject("Access.Application")
+        db_name  = access.CurrentDb().Name
+        db_path  = Path(db_name)
+        log.info(f"Base de données détectée via COM : {db_path}")
+        return db_path
+    except Exception as e:
+        log.debug(f"COM get_db_path échoué : {e}")
+        return None
+
+
+def find_sv_exe_via_psutil() -> "Path | None":
+    """
+    Recherche studiovision.exe parmi les processus en cours et
+    retourne son chemin complet sur le disque.
+    """
+    target = "studiovision.exe"
+    try:
+        for proc in psutil.process_iter(["name", "exe"]):
+            name = (proc.info.get("name") or "").lower()
+            if name == target:
+                exe = proc.info.get("exe")
+                if exe and Path(exe).is_file():
+                    log.info(f"studiovision.exe détecté via psutil : {exe}")
+                    return Path(exe)
+    except Exception as e:
+        log.debug(f"Recherche psutil de studiovision.exe échouée : {e}")
+    return None
+
+
+def create_desktop_shortcut(target_exe: Path, icon_exe: "Path | None" = None) -> None:
+    """
+    Crée un raccourci '.lnk' nommé 'Studio Vision - Connected'
+    sur le Bureau de l'utilisateur courant.
+
+    Paramètres
+    ----------
+    target_exe : Path
+        Chemin vers l'exécutable du routeur (studiovision_monitor_AL.exe).
+    icon_exe : Path | None
+        Chemin vers studiovision.exe dont l'icône sera réutilisée.
+        Si None ou si le fichier est introuvable, l'icône par défaut
+        de target_exe est conservée sans lever d'erreur.
+    """
+    if not WIN32_AVAILABLE:
+        log.warning("win32com non disponible — création du raccourci ignorée.")
+        return
+    try:
+        shell      = win32com.client.Dispatch("WScript.Shell")
+        desktop    = shell.SpecialFolders("Desktop")
+        lnk_path   = os.path.join(desktop, "Studio Vision - Connected.lnk")
+        shortcut   = shell.CreateShortcut(lnk_path)
+        shortcut.TargetPath       = str(target_exe)
+        shortcut.WorkingDirectory = str(target_exe.parent)
+        shortcut.Description      = "Lance Studio Vision avec le routeur d'images intégré"
+
+        # --- Icône : on tente d'emprunter celle de studiovision.exe ---
+        if icon_exe is not None and Path(icon_exe).is_file():
+            # Format attendu par WScript.Shell : "chemin_exe, index_icône"
+            # L'index 0 correspond à la première (et généralement unique) icône
+            # embarquée dans l'exécutable.
+            shortcut.IconLocation = f"{icon_exe}, 0"
+            log.info(f"Icône du raccourci : {icon_exe} (index 0)")
+        else:
+            log.info(
+                "Icône de studiovision.exe non disponible — "
+                "icône par défaut du routeur conservée."
+            )
+
+        shortcut.save()
+        log.info(f"Raccourci Bureau créé : {lnk_path}")
+    except Exception as e:
+        log.error(f"Impossible de créer le raccourci Bureau : {e}")
+
+
+# ---------------------------------------------------------------------------
+#  INTERFACE DE CONFIGURATION (PREMIÈRE INSTALLATION)
+# ---------------------------------------------------------------------------
+
+def configurer_via_interface(config_path: Path) -> None:
+    """
+    Première configuration — flux UX minimal : 3 interactions seulement.
+
+      1. Une boîte de bienvenue  →  rappel Studio Vision ouvert + annonce filedialog
+      2. filedialog               →  sélection du dossier SOURCE
+      3. Popup de succès          →  confirmation + nom du raccourci créé
+
+    Tout le reste (PUBLIC.MDB, DOCUM.MDB, DEST_PHOTOS, studiovision.exe)
+    est détecté automatiquement, sans solliciter le médecin.
+    """
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
 
+    # ------------------------------------------------------------------
+    # ÉTAPE 1 — Bienvenue : une seule popup, texte court et aéré
+    # ------------------------------------------------------------------
     messagebox.showinfo(
-        "Installation du Routeur", 
-        "Première utilisation détectée.\nNous allons configurer les dossiers ensemble."
+        "Configuration du Routeur d'Images",
+        "1.  Assurez-vous que Studio Vision est actuellement OUVERT.\n\n"
+        "2.  Cliquez sur OK pour sélectionner le dossier\n"
+        "     où votre appareil photo envoie les images."
     )
 
-    box_name = simpledialog.askstring("Nom du poste", "Comment s'appelle ce poste ? (ex: Box 1) :")
-    if not box_name:
-        box_name = "StudioVision Monitor"
+    # ------------------------------------------------------------------
+    # Détections automatiques (silencieuses pour l'utilisateur)
+    # ------------------------------------------------------------------
+    public_mdb = get_db_path_from_com()
 
-    default_exam_name = simpledialog.askstring(
-        "Nom de l'examen", 
-        "Quel nom par défaut donner aux examens venant de cette machine ?\n(ex: OCT, Rétinophoto, Champ Visuel) :"
-    )
-    if not default_exam_name:
-        default_exam_name = "Image"
-
-    messagebox.showinfo("Étape 1/4", "Sélectionnez le dossier SOURCE\n(Là où les machines envoient les images)")
-    source_dir = filedialog.askdirectory(title="Dossier SOURCE")
-    orphan_dir = str(Path(source_dir) / "Orphelins") if source_dir else ""
-
-    messagebox.showinfo("Étape 2/4", "Sélectionnez le dossier DESTINATION\n(Le dossier Photos de StudioVision)")
-    dest_photos = filedialog.askdirectory(title="Dossier DESTINATION")
-
-    messagebox.showinfo("Étape 3/4", "Sélectionnez la base de données PUBLIC.MDB")
-    public_mdb = filedialog.askopenfilename(
-        title="Sélectionner PUBLIC.MDB", 
-        filetypes=[("Fichiers Access", "*.mdb;*.accdb")]
-    )
-
-    messagebox.showinfo("Étape 4/4", "Sélectionnez la base de données DOCUM.MDB")
-    docum_mdb = filedialog.askopenfilename(
-        title="Sélectionner DOCUM.MDB", 
-        filetypes=[("Fichiers Access", "*.mdb;*.accdb")]
-    )
-
-    if not all([source_dir, dest_photos, public_mdb, docum_mdb]):
-        messagebox.showerror("Erreur", "Configuration incomplète. L'application va se fermer.")
+    if public_mdb is None:
+        messagebox.showerror(
+            "Studio Vision introuvable",
+            "Studio Vision ne répond pas.\n\n"
+            "Ouvrez Studio Vision, puis relancez l'installation."
+        )
         sys.exit(1)
 
-    # Création du fichier config.ini
+    sv_base_dir     = public_mdb.parent
+    docum_mdb       = sv_base_dir / "DOCUM.MDB"
+    dest_photos     = sv_base_dir / "Photos"
+    sv_exe_path     = find_sv_exe_via_psutil()
+    sv_exe_path_str = str(sv_exe_path) if sv_exe_path else ""
+
+    log.info(f"PUBLIC.MDB  : {public_mdb}")
+    log.info(f"DOCUM.MDB   : {docum_mdb}")
+    log.info(f"DEST_PHOTOS : {dest_photos}")
+    log.info(f"SV exe      : {sv_exe_path_str or '(non détecté)'}")
+
+    # ------------------------------------------------------------------
+    # ÉTAPE 2 — Sélection du dossier SOURCE (seule action requise)
+    # ------------------------------------------------------------------
+    source_dir = filedialog.askdirectory(
+        title="Sélectionnez le dossier de l'appareil photo"
+    )
+    if not source_dir:
+        messagebox.showerror(
+            "Installation annulée",
+            "Aucun dossier sélectionné.\n"
+            "Relancez l'installation pour recommencer."
+        )
+        sys.exit(1)
+
+    orphan_dir = str(Path(source_dir) / "Orphelins")
+
+    # ------------------------------------------------------------------
+    # Écriture du config.ini  (silencieux)
+    # ------------------------------------------------------------------
     cfg = configparser.ConfigParser()
     cfg["GENERAL"] = {
-        "BOX_NAME": box_name,
-        "DEFAULT_EXAM_NAME": default_exam_name
+        "BOX_NAME":          "StudioVision Monitor",
+        "DEFAULT_EXAM_NAME": "Image",
     }
     cfg["PATHS"] = {
-        "SOURCE_DIR": source_dir,
-        "ORPHAN_DIR": orphan_dir,
-        "DEST_PHOTOS": dest_photos,
-        "PUBLIC_MDB": public_mdb,
-        "DOCUM_MDB": docum_mdb
+        "SOURCE_DIR":             source_dir,
+        "ORPHAN_DIR":             orphan_dir,
+        "DEST_PHOTOS":            str(dest_photos),
+        "PUBLIC_MDB":             str(public_mdb),
+        "DOCUM_MDB":              str(docum_mdb),
+        "STUDIO_VISION_EXE_PATH": sv_exe_path_str,
     }
     cfg["TIMEOUTS"] = {"PATIENT_WAIT_TIMEOUT": "900"}
 
     with open(config_path, "w", encoding="utf-8") as f:
         cfg.write(f)
-    
-    messagebox.showinfo("Terminé", "Configuration sauvegardée avec succès !\nLe routeur va maintenant démarrer en arrière-plan.")
+    log.info(f"config.ini écrit dans : {config_path}")
+
+    # Création du raccourci Bureau  (silencieuse)
+    own_exe = Path(sys.executable) if getattr(sys, "frozen", False) else Path(__file__).resolve()
+    create_desktop_shortcut(own_exe, icon_exe=sv_exe_path)
+
+    # ------------------------------------------------------------------
+    # ÉTAPE 3 — Confirmation : courte, lisible, actionnable
+    # ------------------------------------------------------------------
+    messagebox.showinfo(
+        "Installation terminée !",
+        "Le raccourci  'Studio Vision - Connected'  a été créé\n"
+        "sur votre Bureau.\n\n"
+        "Utilisez-le désormais pour lancer votre logiciel."
+    )
     root.destroy()
+
+
+# ---------------------------------------------------------------------------
+#  CHARGEMENT DE LA CONFIGURATION
+# ---------------------------------------------------------------------------
 
 _config_path = Path(__file__).parent / "config.ini"
 
@@ -138,19 +271,22 @@ if not _config_path.exists():
     configurer_via_interface(_config_path)
 
 config = configparser.ConfigParser()
-config.read(_config_path, encoding='utf-8')
+config.read(_config_path, encoding="utf-8")
 
-BOX_NAME          = config.get("GENERAL", "BOX_NAME", fallback="StudioVision Monitor")
-DEFAULT_EXAM_NAME = config.get("GENERAL", "DEFAULT_EXAM_NAME", fallback="Image")
-SOURCE_DIR        = Path(config.get("PATHS", "SOURCE_DIR"))
-ORPHAN_DIR        = Path(config.get("PATHS", "ORPHAN_DIR"))
-DEST_PHOTOS       = Path(config.get("PATHS", "DEST_PHOTOS"))
-PUBLIC_MDB        = Path(config.get("PATHS", "PUBLIC_MDB"))
-DOCUM_MDB         = Path(config.get("PATHS", "DOCUM_MDB"))
-PATIENT_WAIT_TIMEOUT = config.getint("TIMEOUTS", "PATIENT_WAIT_TIMEOUT", fallback=900)
+BOX_NAME               = config.get("GENERAL", "BOX_NAME",           fallback="StudioVision Monitor")
+DEFAULT_EXAM_NAME      = config.get("GENERAL", "DEFAULT_EXAM_NAME",  fallback="Image")
+SOURCE_DIR             = Path(config.get("PATHS", "SOURCE_DIR"))
+ORPHAN_DIR             = Path(config.get("PATHS", "ORPHAN_DIR"))
+DEST_PHOTOS            = Path(config.get("PATHS", "DEST_PHOTOS"))
+PUBLIC_MDB             = Path(config.get("PATHS", "PUBLIC_MDB"))
+DOCUM_MDB              = Path(config.get("PATHS", "DOCUM_MDB"))
+# Chemin complet de studiovision.exe (vide = lancement automatique désactivé)
+STUDIO_VISION_EXE_PATH = config.get("PATHS", "STUDIO_VISION_EXE_PATH", fallback="")
+PATIENT_WAIT_TIMEOUT   = config.getint("TIMEOUTS", "PATIENT_WAIT_TIMEOUT", fallback=900)
 
-STUDIO_VISION_EXE      = "studiovision.exe"
-WATCHED_EXTENSIONS     = {".jpg", ".jpeg", ".jfif", ".png", ".bmp", ".tif", ".tiff", ".dcm", ".pdf", ".rtf", ".doc", ".docx", ".odt", ".xps", ".html"}
+STUDIO_VISION_EXE      = "studiovision.exe"          # nom du processus (pour psutil)
+WATCHED_EXTENSIONS     = {".jpg", ".jpeg", ".jfif", ".png", ".bmp", ".tif", ".tiff",
+                          ".dcm", ".pdf", ".rtf", ".doc", ".docx", ".odt", ".xps", ".html"}
 FILE_LOCK_RETRY_DELAY  = 3
 FILE_LOCK_MAX_ATTEMPTS = 15
 PATIENT_POLL_INTERVAL  = 3
@@ -230,7 +366,7 @@ def db_connect(mdb_path: Path):
     )
 
 
-def get_active_patient() -> dict | None:
+def get_active_patient() -> "dict | None":
     if not WIN32_AVAILABLE:
         return None
     try:
@@ -264,7 +400,7 @@ def get_active_patient() -> dict | None:
         return None
 
 
-def find_patient_folder(patient_code: str) -> Path | None:
+def find_patient_folder(patient_code: str) -> "Path | None":
     if not PYODBC_AVAILABLE:
         log.error("pyodbc not available.")
         return None
@@ -349,7 +485,7 @@ def _find_sfdoc(form):
     return None
 
 
-def refresh_ui(expected_patient_code: str | None = None) -> None:
+def refresh_ui(expected_patient_code: "str | None" = None) -> None:
     if not WIN32_AVAILABLE:
         return
     try:
@@ -443,7 +579,7 @@ def wait_for_file(file: Path) -> bool:
     log.error(f"Fichier toujours verrouillé après {FILE_LOCK_MAX_ATTEMPTS} tentatives: {file}")
     return False
 
-def move_file(source: Path, dest_folder: Path, label: str = "") -> Path | None:
+def move_file(source: Path, dest_folder: Path, label: str = "") -> "Path | None":
     dest_folder.mkdir(parents=True, exist_ok=True)
     dest = dest_folder / source.name
     if dest.exists():
@@ -479,9 +615,9 @@ def worker(file_queue: queue.Queue) -> None:
     pythoncom.CoInitialize()
     log.info("Worker started.")
 
-    needs_refresh: bool      = False
-    last_patient_code: str | None = None
-    burst_count: int         = 0
+    needs_refresh: bool           = False
+    last_patient_code: "str | None" = None
+    burst_count: int              = 0
 
     try:
         while True:
@@ -654,35 +790,91 @@ def _run_background(file_queue: queue.Queue) -> None:
         if _icon is not None:
             _icon.stop()
 
+
+# ---------------------------------------------------------------------------
+#  LANCEMENT DE STUDIO VISION SI NÉCESSAIRE
+# ---------------------------------------------------------------------------
+
+def _is_sv_running() -> bool:
+    """Retourne True si studiovision.exe est actuellement en cours d'exécution."""
+    return any(
+        (p.info.get("name") or "").lower() == STUDIO_VISION_EXE
+        for p in psutil.process_iter(["name"])
+    )
+
+
+def _ensure_sv_running() -> None:
+    """
+    Vérifie si Studio Vision est ouvert.
+    S'il ne l'est pas et que le chemin de l'exe est configuré,
+    le lance et attend jusqu'à 30 secondes qu'il soit prêt.
+    """
+    if _is_sv_running():
+        log.info("Studio Vision est déjà en cours d'exécution.")
+        return
+
+    if not STUDIO_VISION_EXE_PATH:
+        log.warning(
+            "STUDIO_VISION_EXE_PATH non configuré — "
+            "lancement automatique de Studio Vision désactivé."
+        )
+        return
+
+    sv_exe = Path(STUDIO_VISION_EXE_PATH)
+    if not sv_exe.is_file():
+        log.error(
+            f"studiovision.exe introuvable à l'emplacement configuré : {sv_exe}\n"
+            "Lancement automatique annulé."
+        )
+        return
+
+    log.info(f"Studio Vision non détecté — lancement depuis : {sv_exe}")
+    try:
+        subprocess.Popen([str(sv_exe)], cwd=str(sv_exe.parent))
+    except Exception as e:
+        log.error(f"Impossible de lancer Studio Vision : {e}")
+        return
+
+    # Attente active : jusqu'à 30 s pour que le processus apparaisse
+    _SV_LAUNCH_TIMEOUT = 30
+    for elapsed in range(_SV_LAUNCH_TIMEOUT):
+        time.sleep(1)
+        if _is_sv_running():
+            log.info(f"Studio Vision démarré avec succès (après ~{elapsed + 1}s).")
+            return
+
+    log.warning(
+        f"Studio Vision n'a pas démarré dans les {_SV_LAUNCH_TIMEOUT}s imparties. "
+        "Le routeur va continuer et attendra la connexion COM."
+    )
+
+
+# ---------------------------------------------------------------------------
+#  POINT D'ENTRÉE PRINCIPAL
+# ---------------------------------------------------------------------------
+
 def main() -> None:
     global _icon, _mutex_handle
 
-    # Single-instance guard: exit silently if already running.
+    # ------------------------------------------------------------------
+    # 1. Garde single-instance : quitter silencieusement si déjà actif.
+    #    Ce mutex est le seul mécanisme anti-doublon — il couvre tous les
+    #    scénarios (double-clic sur le raccourci, relance, etc.).
+    # ------------------------------------------------------------------
     _mutex_handle = win32event.CreateMutex(None, False, "ImageRouter_StudioVision_Mutex")
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
+        log.info("Instance déjà en cours — arrêt silencieux.")
         sys.exit(0)
 
-    # Manual-relaunch guard: block double-click restarts while Studio Vision is running.
-    try:
-        parent_name = psutil.Process(os.getpid()).parent().name().lower()
-    except Exception:
-        parent_name = ""
+    # ------------------------------------------------------------------
+    # 2. Lancer Studio Vision si nécessaire.
+    #    Appelé dès le démarrage via le raccourci 'Studio Vision - Connected'.
+    # ------------------------------------------------------------------
+    _ensure_sv_running()
 
-    if parent_name == "explorer.exe":
-        sv_running = any(
-            (p.info["name"] or "").lower() == STUDIO_VISION_EXE
-            for p in psutil.process_iter(["name"])
-        )
-        if sv_running:
-            ctypes.windll.user32.MessageBoxW(
-                0,
-                "Pour relancer le routeur d'images, veuillez fermer complètement "
-                "puis relancer Studio Vision.",
-                "Routeur d'images",
-                0x30,  # MB_ICONWARNING | MB_OK
-            )
-            sys.exit(0)
-
+    # ------------------------------------------------------------------
+    # 3. Vérifications de démarrage
+    # ------------------------------------------------------------------
     prevent_sleep()
 
     if not SOURCE_DIR.exists():
@@ -691,15 +883,19 @@ def main() -> None:
 
     ORPHAN_DIR.mkdir(parents=True, exist_ok=True)
 
-    log.info("Version 4 started")
+    log.info("Version 5 started")
     log.info(f"  Source     : {SOURCE_DIR}")
     log.info(f"  Dest       : {DEST_PHOTOS}")
     log.info(f"  PUBLIC.MDB : {PUBLIC_MDB}")
+    log.info(f"  SV exe     : {STUDIO_VISION_EXE_PATH or '(non configuré)'}")
     log.info(f"  Orphans    : {ORPHAN_DIR}")
     log.info(f"  Log file   : {_LOG_FILE}")
     log.info(f"  Timeout    : {PATIENT_WAIT_TIMEOUT // 60} min")
     log.info(f"  Ext        : {', '.join(sorted(WATCHED_EXTENSIONS))}")
 
+    # ------------------------------------------------------------------
+    # 4. Démarrage des threads de surveillance
+    # ------------------------------------------------------------------
     file_queue: queue.Queue = queue.Queue()
 
     threading.Thread(
@@ -710,6 +906,9 @@ def main() -> None:
         target=_run_background, args=(file_queue,), name="Background", daemon=True
     ).start()
 
+    # ------------------------------------------------------------------
+    # 5. Icône système (system tray)
+    # ------------------------------------------------------------------
     if not TRAY_AVAILABLE:
         log.warning("pystray/Pillow not available — running without system tray.")
         try:

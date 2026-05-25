@@ -1,6 +1,0 @@
-watchdog
-pyodbc
-pywin32
-pystray
-Pillow
-psutil
