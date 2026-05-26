@@ -16,7 +16,6 @@ import shutil
 import ctypes
 import logging
 import threading
-import subprocess
 import pythoncom
 import configparser
 import tkinter as tk
@@ -122,38 +121,42 @@ def get_db_path_from_com() -> "Path | None":
         return None
 
 
-def find_sv_exe_via_psutil() -> "Path | None":
+def get_frontend_path_from_com() -> "Path | None":
     """
-    Recherche studiovision.exe parmi les processus en cours et
-    retourne son chemin complet sur le disque.
+    Retourne le chemin du fichier Frontend Access actuellement ouvert
+    (ex : Ophprog.mde, StudVis.mde, …) via access.CurrentDb().Name.
+
+    Ce chemin est utilisé pour relancer Studio Vision au démarrage du routeur
+    via os.startfile(), ce qui délègue l'ouverture à Windows (association de
+    fichier → MSACCESS.EXE) sans présumer du chemin d'Access lui-même.
     """
-    target = "studiovision.exe"
+    if not WIN32_AVAILABLE:
+        log.warning("win32com non disponible — détection Frontend COM impossible.")
+        return None
     try:
-        for proc in psutil.process_iter(["name", "exe"]):
-            name = (proc.info.get("name") or "").lower()
-            if name == target:
-                exe = proc.info.get("exe")
-                if exe and Path(exe).is_file():
-                    log.info(f"studiovision.exe détecté via psutil : {exe}")
-                    return Path(exe)
+        access        = win32com.client.GetActiveObject("Access.Application")
+        frontend_name = access.CurrentDb().Name
+        frontend_path = Path(frontend_name)
+        log.info(f"Frontend Access détecté via COM : {frontend_path}")
+        return frontend_path
     except Exception as e:
-        log.debug(f"Recherche psutil de studiovision.exe échouée : {e}")
-    return None
+        log.warning(f"Détection Frontend via COM échouée : {e}")
+        return None
 
 
-def create_desktop_shortcut(target_exe: Path, icon_exe: "Path | None" = None) -> None:
+def create_desktop_shortcut(target_exe: Path) -> None:
     """
     Crée un raccourci '.lnk' nommé 'Studio Vision - Connected'
     sur le Bureau de l'utilisateur courant.
+
+    L'icône utilisée est celle embarquée dans target_exe (le routeur compilé).
+    Aucune tentative d'emprunter l'icône d'un .mde / .mdb tiers, car ces
+    fichiers ne contiennent pas d'icônes extractibles par WScript.Shell.
 
     Paramètres
     ----------
     target_exe : Path
         Chemin vers l'exécutable du routeur (studiovision_monitor_AL.exe).
-    icon_exe : Path | None
-        Chemin vers studiovision.exe dont l'icône sera réutilisée.
-        Si None ou si le fichier est introuvable, l'icône par défaut
-        de target_exe est conservée sans lever d'erreur.
     """
     if not WIN32_AVAILABLE:
         log.warning("win32com non disponible — création du raccourci ignorée.")
@@ -166,20 +169,8 @@ def create_desktop_shortcut(target_exe: Path, icon_exe: "Path | None" = None) ->
         shortcut.TargetPath       = str(target_exe)
         shortcut.WorkingDirectory = str(target_exe.parent)
         shortcut.Description      = "Lance Studio Vision avec le routeur d'images intégré"
-
-        # --- Icône : on tente d'emprunter celle de studiovision.exe ---
-        if icon_exe is not None and Path(icon_exe).is_file():
-            # Format attendu par WScript.Shell : "chemin_exe, index_icône"
-            # L'index 0 correspond à la première (et généralement unique) icône
-            # embarquée dans l'exécutable.
-            shortcut.IconLocation = f"{icon_exe}, 0"
-            log.info(f"Icône du raccourci : {icon_exe} (index 0)")
-        else:
-            log.info(
-                "Icône de studiovision.exe non disponible — "
-                "icône par défaut du routeur conservée."
-            )
-
+        # Icône : icône par défaut de l'exécutable compilé (index 0)
+        shortcut.IconLocation     = f"{target_exe}, 0"
         shortcut.save()
         log.info(f"Raccourci Bureau créé : {lnk_path}")
     except Exception as e:
@@ -269,12 +260,17 @@ def configurer_via_interface(config_path: Path) -> None:
         dest_photos = Path(_photos_manual)
         log.info(f"DEST_PHOTOS sélectionné manuellement : {dest_photos}")
 
-    sv_exe_path     = find_sv_exe_via_psutil()
-    sv_exe_path_str = str(sv_exe_path) if sv_exe_path else ""
+    # ------------------------------------------------------------------
+    # Détection du Frontend Access via COM (silencieuse pour l'utilisateur)
+    # Le chemin du .mde/.mdb Frontend est lu depuis la même instance COM
+    # déjà ouverte — aucune recherche psutil nécessaire.
+    # ------------------------------------------------------------------
+    sv_frontend_path     = get_frontend_path_from_com()
+    sv_frontend_path_str = str(sv_frontend_path) if sv_frontend_path else ""
 
-    log.info(f"BACKEND_MDB : {backend_mdb}")
-    log.info(f"DEST_PHOTOS : {dest_photos}")
-    log.info(f"SV exe      : {sv_exe_path_str or '(non détecté)'}")
+    log.info(f"BACKEND_MDB      : {backend_mdb}")
+    log.info(f"DEST_PHOTOS      : {dest_photos}")
+    log.info(f"SV Frontend      : {sv_frontend_path_str or '(non détecté)'}")
 
     # ------------------------------------------------------------------
     # ÉTAPE 2 — Sélection du dossier SOURCE (seule action requise)
@@ -301,11 +297,11 @@ def configurer_via_interface(config_path: Path) -> None:
         "DEFAULT_EXAM_NAME": "Image",
     }
     cfg["PATHS"] = {
-        "SOURCE_DIR":             source_dir,
-        "ORPHAN_DIR":             orphan_dir,
-        "DEST_PHOTOS":            str(dest_photos),
-        "BACKEND_MDB":            str(backend_mdb),
-        "STUDIO_VISION_EXE_PATH": sv_exe_path_str,
+        "SOURCE_DIR":        source_dir,
+        "ORPHAN_DIR":        orphan_dir,
+        "DEST_PHOTOS":       str(dest_photos),
+        "BACKEND_MDB":       str(backend_mdb),
+        "SV_FRONTEND_PATH":  sv_frontend_path_str,
     }
     cfg["TIMEOUTS"] = {"PATIENT_WAIT_TIMEOUT": "900"}
 
@@ -313,9 +309,9 @@ def configurer_via_interface(config_path: Path) -> None:
         cfg.write(f)
     log.info(f"config.ini écrit dans : {config_path}")
 
-    # Création du raccourci Bureau  (silencieuse)
+    # Création du raccourci Bureau  (silencieuse — icône par défaut du .exe)
     own_exe = Path(sys.executable) if getattr(sys, "frozen", False) else Path(__file__).resolve()
-    create_desktop_shortcut(own_exe, icon_exe=sv_exe_path)
+    create_desktop_shortcut(own_exe)
 
     # ------------------------------------------------------------------
     # ÉTAPE 3 — Confirmation : courte, lisible, actionnable
@@ -333,7 +329,14 @@ def configurer_via_interface(config_path: Path) -> None:
 #  CHARGEMENT DE LA CONFIGURATION
 # ---------------------------------------------------------------------------
 
-_config_path = Path(__file__).parent / "config.ini"
+# Résolution du dossier de base : dossier du .exe en mode compilé (PyInstaller),
+# dossier du .py en mode source. sys._MEIPASS (dossier temporaire de décompression)
+# n'est volontairement PAS utilisé — le config.ini doit persister entre les lancements.
+if getattr(sys, "frozen", False):
+    _base_dir = Path(sys.executable).parent
+else:
+    _base_dir = Path(__file__).resolve().parent
+_config_path = _base_dir / "config.ini"
 
 if not _config_path.exists():
     configurer_via_interface(_config_path)
@@ -341,21 +344,26 @@ if not _config_path.exists():
 config = configparser.ConfigParser()
 config.read(_config_path, encoding="utf-8")
 
-BOX_NAME               = config.get("GENERAL", "BOX_NAME",           fallback="StudioVision Monitor")
-DEFAULT_EXAM_NAME      = config.get("GENERAL", "DEFAULT_EXAM_NAME",  fallback="Image")
-SOURCE_DIR             = Path(config.get("PATHS", "SOURCE_DIR"))
-ORPHAN_DIR             = Path(config.get("PATHS", "ORPHAN_DIR"))
-DEST_PHOTOS            = Path(config.get("PATHS", "DEST_PHOTOS"))
+BOX_NAME             = config.get("GENERAL", "BOX_NAME",          fallback="StudioVision Monitor")
+DEFAULT_EXAM_NAME    = config.get("GENERAL", "DEFAULT_EXAM_NAME", fallback="Image")
+SOURCE_DIR           = Path(config.get("PATHS", "SOURCE_DIR"))
+ORPHAN_DIR           = Path(config.get("PATHS", "ORPHAN_DIR"))
+DEST_PHOTOS          = Path(config.get("PATHS", "DEST_PHOTOS"))
 # Rétrocompatibilité : anciens config.ini écrits avec la clé "PUBLIC_MDB"
-BACKEND_MDB            = Path(
+BACKEND_MDB          = Path(
     config.get("PATHS", "BACKEND_MDB",
                fallback=config.get("PATHS", "PUBLIC_MDB", fallback=""))
 )
-# Chemin complet de studiovision.exe (vide = lancement automatique désactivé)
-STUDIO_VISION_EXE_PATH = config.get("PATHS", "STUDIO_VISION_EXE_PATH", fallback="")
-PATIENT_WAIT_TIMEOUT   = config.getint("TIMEOUTS", "PATIENT_WAIT_TIMEOUT", fallback=900)
+# Chemin du Frontend Access (.mde/.mdb) — lancé via os.startfile().
+# Rétrocompatibilité : anciens config.ini écrits avec "STUDIO_VISION_EXE_PATH".
+SV_FRONTEND_PATH     = config.get(
+    "PATHS", "SV_FRONTEND_PATH",
+    fallback=config.get("PATHS", "STUDIO_VISION_EXE_PATH", fallback="")
+)
+PATIENT_WAIT_TIMEOUT = config.getint("TIMEOUTS", "PATIENT_WAIT_TIMEOUT", fallback=900)
 
-STUDIO_VISION_EXE      = "studiovision.exe"          # nom du processus (pour psutil)
+# Processus à surveiller pour détecter si Access / Studio Vision est ouvert
+_MSACCESS_EXE        = "msaccess.exe"
 WATCHED_EXTENSIONS     = {".jpg", ".jpeg", ".jfif", ".png", ".bmp", ".tif", ".tiff",
                           ".dcm", ".pdf", ".rtf", ".doc", ".docx", ".odt", ".xps", ".html"}
 FILE_LOCK_RETRY_DELAY  = 3
@@ -867,55 +875,62 @@ def _run_background(file_queue: queue.Queue) -> None:
 # ---------------------------------------------------------------------------
 
 def _is_sv_running() -> bool:
-    """Retourne True si studiovision.exe est actuellement en cours d'exécution."""
+    """
+    Retourne True si MSACCESS.EXE est actuellement en cours d'exécution.
+    Studio Vision étant un Frontend Access (.mde/.mdb), c'est toujours
+    MSACCESS.EXE qui est le processus réel à surveiller.
+    """
     return any(
-        (p.info.get("name") or "").lower() == STUDIO_VISION_EXE
+        (p.info.get("name") or "").lower() == _MSACCESS_EXE
         for p in psutil.process_iter(["name"])
     )
 
 
 def _ensure_sv_running() -> None:
     """
-    Vérifie si Studio Vision est ouvert.
-    S'il ne l'est pas et que le chemin de l'exe est configuré,
-    le lance et attend jusqu'à 30 secondes qu'il soit prêt.
+    Vérifie si MSACCESS.EXE est ouvert.
+    S'il ne l'est pas et que le chemin du Frontend est configuré,
+    ouvre le fichier Frontend via os.startfile() (association Windows
+    .mde/.mdb → Access) et attend jusqu'à 30 secondes qu'Access soit prêt.
     """
     if _is_sv_running():
-        log.info("Studio Vision est déjà en cours d'exécution.")
+        log.info("MSACCESS.EXE est déjà en cours d'exécution.")
         return
 
-    if not STUDIO_VISION_EXE_PATH:
+    if not SV_FRONTEND_PATH:
         log.warning(
-            "STUDIO_VISION_EXE_PATH non configuré — "
+            "SV_FRONTEND_PATH non configuré — "
             "lancement automatique de Studio Vision désactivé."
         )
         return
 
-    sv_exe = Path(STUDIO_VISION_EXE_PATH)
-    if not sv_exe.is_file():
+    sv_frontend = Path(SV_FRONTEND_PATH)
+    if not sv_frontend.is_file():
         log.error(
-            f"studiovision.exe introuvable à l'emplacement configuré : {sv_exe}\n"
+            f"Frontend introuvable à l'emplacement configuré : {sv_frontend}\n"
             "Lancement automatique annulé."
         )
         return
 
-    log.info(f"Studio Vision non détecté — lancement depuis : {sv_exe}")
+    log.info(f"MSACCESS.EXE non détecté — ouverture du Frontend : {sv_frontend}")
     try:
-        subprocess.Popen([str(sv_exe)], cwd=str(sv_exe.parent))
+        # os.startfile délègue à Windows l'association .mde/.mdb → MSACCESS.EXE,
+        # sans avoir à connaître le chemin d'installation d'Office.
+        os.startfile(str(sv_frontend))
     except Exception as e:
-        log.error(f"Impossible de lancer Studio Vision : {e}")
+        log.error(f"Impossible d'ouvrir le Frontend Studio Vision : {e}")
         return
 
-    # Attente active : jusqu'à 30 s pour que le processus apparaisse
+    # Attente active : jusqu'à 30 s pour qu'MSACCESS.EXE apparaisse
     _SV_LAUNCH_TIMEOUT = 30
     for elapsed in range(_SV_LAUNCH_TIMEOUT):
         time.sleep(1)
         if _is_sv_running():
-            log.info(f"Studio Vision démarré avec succès (après ~{elapsed + 1}s).")
+            log.info(f"MSACCESS.EXE démarré avec succès (après ~{elapsed + 1}s).")
             return
 
     log.warning(
-        f"Studio Vision n'a pas démarré dans les {_SV_LAUNCH_TIMEOUT}s imparties. "
+        f"MSACCESS.EXE n'a pas démarré dans les {_SV_LAUNCH_TIMEOUT}s imparties. "
         "Le routeur va continuer et attendra la connexion COM."
     )
 
@@ -958,7 +973,7 @@ def main() -> None:
     log.info(f"  Source      : {SOURCE_DIR}")
     log.info(f"  Dest        : {DEST_PHOTOS}")
     log.info(f"  BACKEND_MDB : {BACKEND_MDB}")
-    log.info(f"  SV exe      : {STUDIO_VISION_EXE_PATH or '(non configuré)'}")
+    log.info(f"  SV Frontend : {SV_FRONTEND_PATH or '(non configuré)'}")
     log.info(f"  Orphans     : {ORPHAN_DIR}")
     log.info(f"  Log file    : {_LOG_FILE}")
     log.info(f"  Timeout     : {PATIENT_WAIT_TIMEOUT // 60} min")
