@@ -10,12 +10,14 @@ Dependencies: watchdog, pyodbc, pywin32, pythoncom, pystray, Pillow, psutil
 
 import os
 import sys
+import json
 import time
 import queue
 import shutil
 import ctypes
 import logging
 import threading
+import subprocess
 import pythoncom
 import configparser
 import tkinter as tk
@@ -121,27 +123,31 @@ def get_db_path_from_com() -> "Path | None":
         return None
 
 
-def get_frontend_path_from_com() -> "Path | None":
+def capture_sv_cmdline() -> "tuple[list[str], str] | tuple[None, None]":
     """
-    Retourne le chemin du fichier Frontend Access actuellement ouvert
-    (ex : Ophprog.mde, StudVis.mde, …) via access.CurrentDb().Name.
+    Trouve le processus MSACCESS.EXE en cours d'exécution via psutil et capture :
+      - sa ligne de commande complète (liste de strings, arguments inclus)
+      - son répertoire de travail (cwd)
 
-    Ce chemin est utilisé pour relancer Studio Vision au démarrage du routeur
-    via os.startfile(), ce qui délègue l'ouverture à Windows (association de
-    fichier → MSACCESS.EXE) sans présumer du chemin d'Access lui-même.
+    Ces deux valeurs sont sauvegardées dans config.ini pour permettre un
+    re-lancement à l'identique, avec tous les arguments spécifiques au cabinet
+    (ex: /wrkgrp system.mdw /User /Pwd /X demarrage).
+
+    Retourne (cmdline_list, cwd_str) ou (None, None) si le processus est introuvable.
     """
-    if not WIN32_AVAILABLE:
-        log.warning("win32com non disponible — détection Frontend COM impossible.")
-        return None
     try:
-        access        = win32com.client.GetActiveObject("Access.Application")
-        frontend_name = access.CurrentDb().Name
-        frontend_path = Path(frontend_name)
-        log.info(f"Frontend Access détecté via COM : {frontend_path}")
-        return frontend_path
+        for proc in psutil.process_iter(["name"]):
+            if (proc.info.get("name") or "").lower() == "msaccess.exe":
+                cmdline = proc.cmdline()   # liste complète : [exe, arg1, arg2, ...]
+                cwd     = proc.cwd()
+                if cmdline:
+                    log.info(f"Commande MSACCESS.EXE capturée : {cmdline}")
+                    log.info(f"Répertoire de travail           : {cwd}")
+                    return cmdline, cwd
     except Exception as e:
-        log.warning(f"Détection Frontend via COM échouée : {e}")
-        return None
+        log.warning(f"Capture cmdline MSACCESS.EXE échouée : {e}")
+    log.warning("MSACCESS.EXE introuvable via psutil — commande non capturée.")
+    return None, None
 
 
 def create_desktop_shortcut(target_exe: Path) -> None:
@@ -265,16 +271,18 @@ def configurer_via_interface(config_path: Path) -> None:
         log.info(f"DEST_PHOTOS sélectionné manuellement : {dest_photos}")
 
     # ------------------------------------------------------------------
-    # Détection du Frontend Access via COM (silencieuse pour l'utilisateur)
-    # Le chemin du .mde/.mdb Frontend est lu depuis la même instance COM
-    # déjà ouverte — aucune recherche psutil nécessaire.
+    # Capture de la commande de lancement de MSACCESS.EXE via psutil.
+    # On récupère la cmdline complète (arguments /wrkgrp, /X, etc.) et le
+    # répertoire de travail pour pouvoir re-lancer à l'identique plus tard.
     # ------------------------------------------------------------------
-    sv_frontend_path     = get_frontend_path_from_com()
-    sv_frontend_path_str = str(sv_frontend_path) if sv_frontend_path else ""
+    sv_cmdline, sv_cwd = capture_sv_cmdline()
+    sv_cmdline_json    = json.dumps(sv_cmdline) if sv_cmdline else "[]"
+    sv_cwd_str         = sv_cwd or ""
 
-    log.info(f"BACKEND_MDB      : {backend_mdb}")
-    log.info(f"DEST_PHOTOS      : {dest_photos}")
-    log.info(f"SV Frontend      : {sv_frontend_path_str or '(non détecté)'}")
+    log.info(f"BACKEND_MDB : {backend_mdb}")
+    log.info(f"DEST_PHOTOS : {dest_photos}")
+    log.info(f"SV_CMDLINE  : {sv_cmdline_json}")
+    log.info(f"SV_CWD      : {sv_cwd_str or '(vide)'}")
 
     # ------------------------------------------------------------------
     # ÉTAPE 2 — Sélection du dossier SOURCE (seule action requise)
@@ -302,11 +310,12 @@ def configurer_via_interface(config_path: Path) -> None:
         "DEFAULT_EXAM_NAME": "Image",
     }
     cfg["PATHS"] = {
-        "SOURCE_DIR":        source_dir,
-        "ORPHAN_DIR":        orphan_dir,
-        "DEST_PHOTOS":       str(dest_photos),
-        "BACKEND_MDB":       str(backend_mdb),
-        "SV_FRONTEND_PATH":  sv_frontend_path_str,
+        "SOURCE_DIR":  source_dir,
+        "ORPHAN_DIR":  orphan_dir,
+        "DEST_PHOTOS": str(dest_photos),
+        "BACKEND_MDB": str(backend_mdb),
+        "SV_CMDLINE":  sv_cmdline_json,
+        "SV_CWD":      sv_cwd_str,
     }
     cfg["TIMEOUTS"] = {"PATIENT_WAIT_TIMEOUT": "900"}
 
@@ -363,12 +372,18 @@ BACKEND_MDB          = Path(
     config.get("PATHS", "BACKEND_MDB",
                fallback=config.get("PATHS", "PUBLIC_MDB", fallback=""))
 )
-# Chemin du Frontend Access (.mde/.mdb) — lancé via os.startfile().
-# Rétrocompatibilité : anciens config.ini écrits avec "STUDIO_VISION_EXE_PATH".
-SV_FRONTEND_PATH     = config.get(
-    "PATHS", "SV_FRONTEND_PATH",
-    fallback=config.get("PATHS", "STUDIO_VISION_EXE_PATH", fallback="")
-)
+# Commande de lancement de MSACCESS.EXE (liste d'arguments) et répertoire de travail.
+# Rétrocompatibilité : anciens config.ini avec SV_FRONTEND_PATH sont ignorés
+# (l'utilisateur devra reconfigurer une fois pour capturer la vraie cmdline).
+_sv_cmdline_raw = config.get("PATHS", "SV_CMDLINE", fallback="[]")
+try:
+    SV_CMDLINE = json.loads(_sv_cmdline_raw)
+    if not isinstance(SV_CMDLINE, list):
+        raise ValueError("SV_CMDLINE n'est pas une liste JSON valide")
+except Exception as e:
+    log.warning(f"Lecture SV_CMDLINE échouée ({e}) — lancement automatique désactivé.")
+    SV_CMDLINE = []
+SV_CWD = config.get("PATHS", "SV_CWD", fallback="")
 PATIENT_WAIT_TIMEOUT = config.getint("TIMEOUTS", "PATIENT_WAIT_TIMEOUT", fallback=900)
 
 # Processus à surveiller pour détecter si Access / Studio Vision est ouvert
@@ -898,36 +913,29 @@ def _is_sv_running() -> bool:
 def _ensure_sv_running() -> None:
     """
     Vérifie si MSACCESS.EXE est ouvert.
-    S'il ne l'est pas et que le chemin du Frontend est configuré,
-    ouvre le fichier Frontend via os.startfile() (association Windows
-    .mde/.mdb → Access) et attend jusqu'à 30 secondes qu'Access soit prêt.
+    S'il ne l'est pas et que SV_CMDLINE est configuré, relance Studio Vision
+    avec la commande exacte capturée lors de l'installation (arguments /wrkgrp,
+    /X demarrage, etc. inclus) via subprocess.Popen.
     """
     if _is_sv_running():
         log.info("MSACCESS.EXE est déjà en cours d'exécution.")
         return
 
-    if not SV_FRONTEND_PATH:
+    if not SV_CMDLINE:
         log.warning(
-            "SV_FRONTEND_PATH non configuré — "
+            "SV_CMDLINE non configuré — "
             "lancement automatique de Studio Vision désactivé."
         )
         return
 
-    sv_frontend = Path(SV_FRONTEND_PATH)
-    if not sv_frontend.is_file():
-        log.error(
-            f"Frontend introuvable à l'emplacement configuré : {sv_frontend}\n"
-            "Lancement automatique annulé."
-        )
-        return
-
-    log.info(f"MSACCESS.EXE non détecté — ouverture du Frontend : {sv_frontend}")
+    log.info(f"MSACCESS.EXE non détecté — relancement via : {SV_CMDLINE}")
     try:
-        # os.startfile délègue à Windows l'association .mde/.mdb → MSACCESS.EXE,
-        # sans avoir à connaître le chemin d'installation d'Office.
-        os.startfile(str(sv_frontend))
+        subprocess.Popen(
+            SV_CMDLINE,
+            cwd=SV_CWD or None,   # None = héritage du cwd courant si vide
+        )
     except Exception as e:
-        log.error(f"Impossible d'ouvrir le Frontend Studio Vision : {e}")
+        log.error(f"Impossible de relancer Studio Vision : {e}")
         return
 
     # Attente active : jusqu'à 30 s pour qu'MSACCESS.EXE apparaisse
@@ -986,7 +994,8 @@ def main() -> None:
     log.info(f"  Source      : {SOURCE_DIR}")
     log.info(f"  Dest        : {DEST_PHOTOS}")
     log.info(f"  BACKEND_MDB : {BACKEND_MDB}")
-    log.info(f"  SV Frontend : {SV_FRONTEND_PATH or '(non configuré)'}")
+    log.info(f"  SV_CMDLINE  : {SV_CMDLINE or '(non configuré)'}")
+    log.info(f"  SV_CWD      : {SV_CWD or '(vide)'}")
     log.info(f"  Orphans     : {ORPHAN_DIR}")
     log.info(f"  Log file    : {_LOG_FILE}")
     log.info(f"  Timeout     : {PATIENT_WAIT_TIMEOUT // 60} min")
