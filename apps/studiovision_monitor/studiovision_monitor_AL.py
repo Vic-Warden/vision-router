@@ -2,28 +2,28 @@
 Lanceur intelligent + Routeur d'images pour Studio Vision (Microsoft Access).
 
 Rôle au démarrage (via raccourci Bureau) :
-  1. Lancer Studio Vision avec sa commande exacte capturée à l'installation
-     (arguments /wrkgrp, /User, /Pwd, /X demarrage, etc. — 100 % dynamique,
-     aucun chemin hardcodé), exactement comme un script .bat avec 'start'.
+  1. Lancer Studio Vision avec sa commande exacte lue à l'installation depuis
+     le raccourci .lnk original du médecin (TargetPath, Arguments, WorkingDirectory),
+     exactement comme un double-clic sur le raccourci d'origine.
   2. S'exécuter en arrière-plan en tant que routeur d'images.
 
 Pipeline : PollingObserver → file_queue → Worker → Access DB + UI refresh
            (burst debounce 1,5 s, reconnexion automatique sur coupure réseau)
 
-Capture dynamique (première installation) :
-  - psutil détecte MSACCESS.EXE en cours d'exécution et capture sa cmdline
-    complète (process.cmdline()) ainsi que son cwd (process.cwd()).
-  - Ces valeurs sont sérialisées en JSON et sauvegardées dans config.ini
-    sous les clés SV_CMDLINE et SV_CWD (section [PATHS]).
-  - Au démarrage suivant, subprocess.Popen(SV_CMDLINE, cwd=SV_CWD) recrée
-    le lancement à l'identique, sans aucune intervention manuelle.
+Capture via raccourci .lnk (première installation) :
+  - L'utilisateur sélectionne son raccourci Studio Vision habituel (.lnk).
+  - WScript.Shell lit TargetPath (exécutable), Arguments (ex: /wrkgrp ... /User om ...),
+    et WorkingDirectory depuis le fichier .lnk.
+  - Ces 3 valeurs sont sauvegardées dans config.ini sous les clés SV_TARGET,
+    SV_ARGS et SV_CWD (section [PATHS]).
+  - Au démarrage suivant, subprocess.Popen recrée le lancement à l'identique,
+    sans aucune intervention manuelle et sans perte des arguments sensibles.
 
-Dépendances : watchdog, pyodbc, pywin32, pythoncom, pystray, Pillow, psutil
+Dépendances : watchdog, pyodbc, pywin32, pythoncom, pystray, Pillow
 """
 
 import os
 import sys
-import json
 import time
 import queue
 import shutil
@@ -62,7 +62,6 @@ except ImportError:
 import win32api
 import win32event
 import winerror
-import psutil
 
 # --- INITIALISATION DES LOGS ---
 _LOG_DIR  = Path(os.path.expanduser("~")) / "studiovision"
@@ -136,31 +135,37 @@ def get_db_path_from_com() -> "Path | None":
         return None
 
 
-def capture_sv_cmdline() -> "tuple[list[str], str] | tuple[None, None]":
+def lire_raccourci_lnk(lnk_path: str) -> "tuple[str, str, str] | tuple[None, None, None]":
     """
-    Trouve le processus MSACCESS.EXE en cours d'exécution via psutil et capture :
-      - sa ligne de commande complète (liste de strings, arguments inclus)
-      - son répertoire de travail (cwd)
+    Lit un fichier raccourci Windows (.lnk) via WScript.Shell et extrait :
+      - TargetPath      : chemin complet de l'exécutable cible
+      - Arguments       : arguments de lancement (ex: /wrkgrp ... /User om ...)
+      - WorkingDirectory: dossier de démarrage
 
-    Ces deux valeurs sont sauvegardées dans config.ini pour permettre un
-    re-lancement à l'identique, avec tous les arguments spécifiques au cabinet
-    (ex: /wrkgrp system.mdw /User /Pwd /X demarrage).
+    Ces 3 valeurs permettent de recréer un lancement 100 % identique au
+    double-clic sur le raccourci d'origine, y compris les arguments sensibles
+    (groupes de travail, utilisateur, etc.) qui ne sont jamais masqués dans
+    le fichier .lnk, contrairement à la ligne de commande système.
 
-    Retourne (cmdline_list, cwd_str) ou (None, None) si le processus est introuvable.
+    Retourne (target, args, cwd) ou (None, None, None) en cas d'erreur.
     """
+    if not WIN32_AVAILABLE:
+        log.error("win32com non disponible — lecture du raccourci impossible.")
+        return None, None, None
     try:
-        for proc in psutil.process_iter(["name"]):
-            if (proc.info.get("name") or "").lower() == "msaccess.exe":
-                cmdline = proc.cmdline()   # liste complète : [exe, arg1, arg2, ...]
-                cwd     = proc.cwd()
-                if cmdline:
-                    log.info(f"Commande MSACCESS.EXE capturée : {cmdline}")
-                    log.info(f"Répertoire de travail           : {cwd}")
-                    return cmdline, cwd
+        shell    = win32com.client.Dispatch("WScript.Shell")
+        shortcut = shell.CreateShortcut(lnk_path)
+        target   = shortcut.TargetPath      or ""
+        args     = shortcut.Arguments       or ""
+        cwd      = shortcut.WorkingDirectory or ""
+        log.info(f"Raccourci .lnk lu : {lnk_path}")
+        log.info(f"  TargetPath       : {target}")
+        log.info(f"  Arguments        : {args}")
+        log.info(f"  WorkingDirectory : {cwd}")
+        return target, args, cwd
     except Exception as e:
-        log.warning(f"Capture cmdline MSACCESS.EXE échouée : {e}")
-    log.warning("MSACCESS.EXE introuvable via psutil — commande non capturée.")
-    return None, None
+        log.error(f"Lecture du raccourci .lnk échouée ({lnk_path}) : {e}")
+        return None, None, None
 
 
 def create_desktop_shortcut(target_exe: Path) -> None:
@@ -204,17 +209,16 @@ def configurer_via_interface(config_path: Path) -> None:
     """
     Première configuration — flux UX minimal : 3 interactions seulement.
 
-      1. Popup de bienvenue  →  rappel Studio Vision ouvert (requis) + annonce filedialog
-      2. filedialog          →  sélection du dossier SOURCE (appareil photo)
-      3. (si besoin)         →  sélection manuelle du dossier Photos si non détecté
-      4. Popup de succès     →  confirmation + nom du raccourci créé
+      1. Popup de bienvenue     →  invite à sélectionner le raccourci Studio Vision
+      2. filedialog (.lnk)      →  sélection du raccourci Studio Vision habituel
+      3. filedialog (dossier)   →  sélection du dossier SOURCE (appareil photo)
+      4. (si besoin)            →  sélection manuelle du dossier Photos si non détecté
+      5. Popup de succès        →  confirmation + nom du raccourci créé
 
     Détections automatiques (silencieuses) :
       - Backend DB       : via COM (propriété .Connect de la table liée "Documents")
       - DEST_PHOTOS      : heuristique sur l'arborescence réseau (2 niveaux)
-      - SV_CMDLINE/CWD   : psutil capture process.cmdline() + process.cwd() de
-                           MSACCESS.EXE en cours — sauvegardés en JSON dans config.ini
-                           pour permettre un re-lancement à l'identique au démarrage.
+      - SV_TARGET/ARGS/CWD : lecture du fichier .lnk via WScript.Shell
 
     DOCUM.MDB n'est pas utilisé par le routeur et n'est pas configuré.
     """
@@ -223,22 +227,56 @@ def configurer_via_interface(config_path: Path) -> None:
     root.attributes("-topmost", True)
 
     # ------------------------------------------------------------------
-    # ÉTAPE 1 — Bienvenue : une seule popup, texte court et aéré
+    # ÉTAPE 1 — Sélection du raccourci Studio Vision (.lnk)
     # ------------------------------------------------------------------
     messagebox.showinfo(
         "Configuration du Routeur d'Images",
-        "Avant de continuer, vérifiez les deux points suivants :\n\n"
-        "1.  Studio Vision doit être actuellement OUVERT\n"
-        "     EN MODE ADMINISTRATEUR.\n"
-        "     (Sans cela, la liaison avec la base de données\n"
-        "     ne pourra pas être établie automatiquement.)\n\n"
-        "2.  Cliquez sur OK pour sélectionner le dossier\n"
-        "     où votre appareil photo envoie les images."
+        "Pour relier les logiciels, veuillez sélectionner votre raccourci\n"
+        "'Studio Vision' habituel (celui que vous utilisez tous les jours\n"
+        "sur votre Bureau).\n\n"
+        "Cliquez sur OK pour choisir ce raccourci."
     )
+
+    lnk_path = filedialog.askopenfilename(
+        title="Sélectionnez le raccourci Studio Vision",
+        filetypes=[("Raccourci Windows", "*.lnk")],
+    )
+    if not lnk_path:
+        messagebox.showerror(
+            "Installation annulée",
+            "Aucun raccourci sélectionné.\n"
+            "Relancez l'installation pour recommencer."
+        )
+        sys.exit(1)
+
+    sv_target, sv_args, sv_cwd = lire_raccourci_lnk(lnk_path)
+    if not sv_target:
+        messagebox.showerror(
+            "Raccourci illisible",
+            "Impossible de lire les propriétés du raccourci sélectionné.\n\n"
+            "Assurez-vous de sélectionner un fichier .lnk valide\n"
+            "pointant vers Studio Vision, puis relancez l'installation."
+        )
+        sys.exit(1)
+
+    log.info(f"SV_TARGET : {sv_target}")
+    log.info(f"SV_ARGS   : {sv_args}")
+    log.info(f"SV_CWD    : {sv_cwd or '(vide)'}")
 
     # ------------------------------------------------------------------
     # Détections automatiques (silencieuses pour l'utilisateur)
     # ------------------------------------------------------------------
+    messagebox.showinfo(
+        "Configuration du Routeur d'Images",
+        "Raccourci enregistré avec succès.\n\n"
+        "Avant de continuer, vérifiez le point suivant :\n\n"
+        "Studio Vision doit être actuellement OUVERT\n"
+        "EN MODE ADMINISTRATEUR.\n"
+        "(Sans cela, la liaison avec la base de données\n"
+        "ne pourra pas être établie automatiquement.)\n\n"
+        "Cliquez sur OK une fois Studio Vision ouvert."
+    )
+
     backend_mdb = get_db_path_from_com()
 
     if backend_mdb is None:
@@ -288,22 +326,11 @@ def configurer_via_interface(config_path: Path) -> None:
         dest_photos = Path(_photos_manual)
         log.info(f"DEST_PHOTOS sélectionné manuellement : {dest_photos}")
 
-    # ------------------------------------------------------------------
-    # Capture de la commande de lancement de MSACCESS.EXE via psutil.
-    # On récupère la cmdline complète (arguments /wrkgrp, /X, etc.) et le
-    # répertoire de travail pour pouvoir re-lancer à l'identique plus tard.
-    # ------------------------------------------------------------------
-    sv_cmdline, sv_cwd = capture_sv_cmdline()
-    sv_cmdline_json    = json.dumps(sv_cmdline) if sv_cmdline else "[]"
-    sv_cwd_str         = sv_cwd or ""
-
     log.info(f"BACKEND_MDB : {backend_mdb}")
     log.info(f"DEST_PHOTOS : {dest_photos}")
-    log.info(f"SV_CMDLINE  : {sv_cmdline_json}")
-    log.info(f"SV_CWD      : {sv_cwd_str or '(vide)'}")
 
     # ------------------------------------------------------------------
-    # ÉTAPE 2 — Sélection du dossier SOURCE (seule action requise)
+    # ÉTAPE 2 — Sélection du dossier SOURCE (appareil photo)
     # ------------------------------------------------------------------
     source_dir = filedialog.askdirectory(
         title="Sélectionnez le dossier de l'appareil photo"
@@ -332,8 +359,9 @@ def configurer_via_interface(config_path: Path) -> None:
         "ORPHAN_DIR":  orphan_dir,
         "DEST_PHOTOS": str(dest_photos),
         "BACKEND_MDB": str(backend_mdb),
-        "SV_CMDLINE":  sv_cmdline_json,
-        "SV_CWD":      sv_cwd_str,
+        "SV_TARGET":   sv_target,
+        "SV_ARGS":     sv_args,
+        "SV_CWD":      sv_cwd,
     }
     cfg["TIMEOUTS"] = {"PATIENT_WAIT_TIMEOUT": "900"}
 
@@ -390,28 +418,17 @@ BACKEND_MDB          = Path(
     config.get("PATHS", "BACKEND_MDB",
                fallback=config.get("PATHS", "PUBLIC_MDB", fallback=""))
 )
-# Commande de lancement de MSACCESS.EXE (liste d'arguments sérialisée en JSON)
-# et répertoire de travail, capturés via psutil lors de la configuration initiale.
-#
-# Rétrocompatibilité :
-#   - Anciens config.ini écrits avec SV_FRONTEND_PATH (chemin simple vers le .mde)
-#     sont implicitement ignorés : cette clé n'est plus lue. L'utilisateur devra
-#     relancer la configuration une fois pour capturer la vraie cmdline complète.
-#   - Si SV_CMDLINE est absent ou invalide, le lancement automatique est désactivé
-#     sans erreur bloquante (log WARNING + SV_CMDLINE = []).
-_sv_cmdline_raw = config.get("PATHS", "SV_CMDLINE", fallback="[]")
-try:
-    SV_CMDLINE = json.loads(_sv_cmdline_raw)
-    if not isinstance(SV_CMDLINE, list):
-        raise ValueError("SV_CMDLINE n'est pas une liste JSON valide")
-except Exception as e:
-    log.warning(f"Lecture SV_CMDLINE échouée ({e}) — lancement automatique désactivé.")
-    SV_CMDLINE = []
-SV_CWD = config.get("PATHS", "SV_CWD", fallback="")
-PATIENT_WAIT_TIMEOUT = config.getint("TIMEOUTS", "PATIENT_WAIT_TIMEOUT", fallback=900)
+# Paramètres de lancement de Studio Vision — lus depuis le raccourci .lnk
+# à l'installation initiale via lire_raccourci_lnk().
+#   SV_TARGET : chemin de l'exécutable (ex: C:\...\MSACCESS.EXE)
+#   SV_ARGS   : arguments bruts (ex: /wrkgrp system.mdw /User om /X demarrage)
+#   SV_CWD    : dossier de démarrage (WorkingDirectory du raccourci .lnk)
+# Rétrocompatibilité : les anciens config.ini avec SV_CMDLINE ou SV_FRONTEND_PATH
+# ne sont plus lus — l'utilisateur devra relancer la configuration une fois.
+SV_TARGET = config.get("PATHS", "SV_TARGET", fallback="").strip()
+SV_ARGS   = config.get("PATHS", "SV_ARGS",   fallback="").strip()
+SV_CWD    = config.get("PATHS", "SV_CWD",    fallback="").strip()
 
-# Processus à surveiller pour détecter si Access / Studio Vision est ouvert
-_MSACCESS_EXE        = "msaccess.exe"
 WATCHED_EXTENSIONS     = {".jpg", ".jpeg", ".jfif", ".png", ".bmp", ".tif", ".tiff",
                           ".dcm", ".pdf", ".rtf", ".doc", ".docx", ".odt", ".xps", ".html"}
 FILE_LOCK_RETRY_DELAY  = 3
@@ -432,6 +449,7 @@ _icon: "pystray.Icon | None" = None
 _status_text: str             = "Starting..."
 _stop_event: threading.Event  = threading.Event()
 _mutex_handle = None
+
 
 def _make_icon(color: tuple) -> "Image.Image":
     img  = Image.new("RGBA", (_ICON_SIZE, _ICON_SIZE), (0, 0, 0, 0))
@@ -927,36 +945,62 @@ def _is_sv_running() -> bool:
     Retourne True si MSACCESS.EXE est actuellement en cours d'exécution.
     Studio Vision étant un Frontend Access (.mde/.mdb), c'est toujours
     MSACCESS.EXE qui est le processus réel à surveiller.
+
+    Utilise WMIC (disponible sur tout Windows sans dépendance tierce)
+    plutôt que psutil, pour rester Zéro-Config en termes de dépendances.
     """
-    return any(
-        (p.info.get("name") or "").lower() == _MSACCESS_EXE
-        for p in psutil.process_iter(["name"])
-    )
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", f"IMAGENAME eq {_MSACCESS_EXE}", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return _MSACCESS_EXE.lower() in result.stdout.lower()
+    except Exception as e:
+        log.warning(f"Impossible de vérifier si MSACCESS.EXE tourne : {e}")
+        return False
 
 
 def _ensure_sv_running() -> None:
     """
     Vérifie si MSACCESS.EXE est ouvert.
-    S'il ne l'est pas et que SV_CMDLINE est configuré, relance Studio Vision
-    avec la commande exacte capturée lors de l'installation (arguments /wrkgrp,
-    /X demarrage, etc. inclus) via subprocess.Popen.
+    S'il ne l'est pas et que SV_TARGET est configuré, relance Studio Vision
+    exactement comme un double-clic sur le raccourci d'origine :
+      - SV_TARGET : chemin de l'exécutable (issu du raccourci .lnk)
+      - SV_ARGS   : arguments bruts (ex: /wrkgrp ... /User om /Pwd xxx /X demarrage)
+      - SV_CWD    : dossier de démarrage (WorkingDirectory du raccourci .lnk)
+
+    La commande est construite sous forme de chaîne entourée de guillemets
+    pour gérer les chemins avec espaces, puis passée à subprocess.Popen
+    avec shell=True afin que Windows la parse exactement comme cmd.exe le
+    ferait lors du double-clic sur le raccourci.
     """
     if _is_sv_running():
         log.info("MSACCESS.EXE est déjà en cours d'exécution.")
         return
 
-    if not SV_CMDLINE:
+    if not SV_TARGET:
         log.warning(
-            "SV_CMDLINE non configuré — "
+            "SV_TARGET non configuré — "
             "lancement automatique de Studio Vision désactivé."
         )
         return
 
-    log.info(f"MSACCESS.EXE non détecté — relancement via : {SV_CMDLINE}")
+    # Construction de la commande complète : '"chemin\exe" arguments'
+    # Les guillemets autour de SV_TARGET gèrent les espaces dans le chemin.
+    # SV_ARGS est ajouté tel quel, exactement comme dans le raccourci .lnk.
+    cmd = f'"{SV_TARGET}"'
+    if SV_ARGS:
+        cmd = f'{cmd} {SV_ARGS}'
+
+    log.info(f"MSACCESS.EXE non détecté — relancement via : {cmd}")
+    log.info(f"  WorkingDirectory  : {SV_CWD or '(hérité)'}")
     try:
         subprocess.Popen(
-            SV_CMDLINE,
+            cmd,
             cwd=SV_CWD or None,   # None = héritage du cwd courant si vide
+            shell=True,           # nécessaire pour que Windows parse la cmdline correctement
         )
     except Exception as e:
         log.error(f"Impossible de relancer Studio Vision : {e}")
@@ -1018,8 +1062,9 @@ def main() -> None:
     log.info(f"  Source      : {SOURCE_DIR}")
     log.info(f"  Dest        : {DEST_PHOTOS}")
     log.info(f"  BACKEND_MDB : {BACKEND_MDB}")
-    log.info(f"  SV_CMDLINE  : {SV_CMDLINE or '(non configuré)'}")
-    log.info(f"  SV_CWD      : {SV_CWD or '(vide)'}")
+    log.info(f"  SV_TARGET   : {SV_TARGET or '(non configuré)'}")
+    log.info(f"  SV_ARGS     : {SV_ARGS   or '(vide)'}")
+    log.info(f"  SV_CWD      : {SV_CWD    or '(hérité)'}")
     log.info(f"  Orphans     : {ORPHAN_DIR}")
     log.info(f"  Log file    : {_LOG_FILE}")
     log.info(f"  Timeout     : {PATIENT_WAIT_TIMEOUT // 60} min")
