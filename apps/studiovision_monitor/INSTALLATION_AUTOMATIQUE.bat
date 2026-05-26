@@ -45,9 +45,16 @@ if exist "studiovision_monitor_AL.exe" (
     echo [OK] Application copiee dans : %TARGET_DIR%
 ) else (
     echo [ERREUR] Le fichier 'studiovision_monitor_AL.exe' est introuvable !
-    echo Assurez-vous d'avoir telecharge les 3 fichiers dans le meme dossier.
+    echo Assurez-vous d'avoir telecharge les 4 fichiers dans le meme dossier.
     pause
     exit /b
+)
+
+if exist "Studiov2000.ico" (
+    copy /y "Studiov2000.ico" "%TARGET_DIR%\Studiov2000.ico" >nul
+    echo [OK] Icone copiee dans : %TARGET_DIR%
+) else (
+    echo [ALERTE] Fichier 'Studiov2000.ico' absent - icone ignoree.
 )
 echo.
 

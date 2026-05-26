@@ -203,7 +203,10 @@ def create_desktop_shortcut(target_exe: Path) -> None:
         shortcut.TargetPath       = str(target_exe)
         shortcut.WorkingDirectory = str(target_exe.parent)
         shortcut.Description      = "Lance Studio Vision avec le routeur d'images intégré"
-        shortcut.IconLocation     = f"{target_exe}, 0"
+        if ICON_PATH.exists():
+            shortcut.IconLocation = str(ICON_PATH)
+        else:
+            shortcut.IconLocation = f"{target_exe}, 0"
         shortcut.save()
         log.info(f"Raccourci Bureau créé : {lnk_path}")
     except Exception as e:
@@ -356,6 +359,9 @@ def configurer_via_interface(config_path: Path) -> None:
         "créé sur votre Bureau."
     )
     root.destroy()
+    # Arrêt immédiat du processus Administrateur après la configuration.
+    # L'utilisateur relancera via le raccourci Bureau (mode utilisateur normal).
+    sys.exit(0)
 
 # ---------------------------------------------------------------------------
 #  CHARGEMENT DE LA CONFIGURATION
@@ -365,6 +371,7 @@ if getattr(sys, "frozen", False):
 else:
     _base_dir = Path(__file__).resolve().parent
 _config_path = _base_dir / "config.ini"
+ICON_PATH    = _base_dir / "Studiov2000.ico"
 
 if not _config_path.exists():
     configurer_via_interface(_config_path)
@@ -420,7 +427,6 @@ def _set_status(text: str, processing: bool = False) -> None:
     _status_text = text
     if _icon is not None:
         try:
-            _icon.icon = _make_icon(_COLOR_ACTIVE if processing else _COLOR_READY)
             _icon.update_menu()
         except Exception as e:
             log.debug(f"Tray update failed: {e}")
@@ -930,9 +936,13 @@ def main() -> None:
         pystray.MenuItem("Open logs", _open_logs),
         pystray.MenuItem("Quit", _quit),
     )
+    if ICON_PATH.exists():
+        tray_image = Image.open(str(ICON_PATH))
+    else:
+        tray_image = _make_icon(_COLOR_READY)  # Fallback si .ico absent
     _icon = pystray.Icon(
         name=BOX_NAME,
-        icon=_make_icon(_COLOR_READY),
+        icon=tray_image,
         title=BOX_NAME,
         menu=menu,
     )
