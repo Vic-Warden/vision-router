@@ -1,11 +1,24 @@
 """
-Routes incoming imaging files to the correct patient folder,
-inserts a DB record, and refreshes the Access UI.
+Lanceur intelligent + Routeur d'images pour Studio Vision (Microsoft Access).
 
-Pipeline: PollingObserver → file_queue → Worker → Access DB + UI refresh
-          (1.5 s burst debounce, auto-reconnect on network drop)
+Rôle au démarrage (via raccourci Bureau) :
+  1. Lancer Studio Vision avec sa commande exacte capturée à l'installation
+     (arguments /wrkgrp, /User, /Pwd, /X demarrage, etc. — 100 % dynamique,
+     aucun chemin hardcodé), exactement comme un script .bat avec 'start'.
+  2. S'exécuter en arrière-plan en tant que routeur d'images.
 
-Dependencies: watchdog, pyodbc, pywin32, pythoncom, pystray, Pillow, psutil
+Pipeline : PollingObserver → file_queue → Worker → Access DB + UI refresh
+           (burst debounce 1,5 s, reconnexion automatique sur coupure réseau)
+
+Capture dynamique (première installation) :
+  - psutil détecte MSACCESS.EXE en cours d'exécution et capture sa cmdline
+    complète (process.cmdline()) ainsi que son cwd (process.cwd()).
+  - Ces valeurs sont sérialisées en JSON et sauvegardées dans config.ini
+    sous les clés SV_CMDLINE et SV_CWD (section [PATHS]).
+  - Au démarrage suivant, subprocess.Popen(SV_CMDLINE, cwd=SV_CWD) recrée
+    le lancement à l'identique, sans aucune intervention manuelle.
+
+Dépendances : watchdog, pyodbc, pywin32, pythoncom, pystray, Pillow, psutil
 """
 
 import os
@@ -191,14 +204,19 @@ def configurer_via_interface(config_path: Path) -> None:
     """
     Première configuration — flux UX minimal : 3 interactions seulement.
 
-      1. Une boîte de bienvenue  →  rappel Studio Vision ouvert + annonce filedialog
-      2. filedialog               →  sélection du dossier SOURCE
-      3. (si besoin)              →  sélection manuelle du dossier Photos si non détecté
-      4. Popup de succès          →  confirmation + nom du raccourci créé
+      1. Popup de bienvenue  →  rappel Studio Vision ouvert (requis) + annonce filedialog
+      2. filedialog          →  sélection du dossier SOURCE (appareil photo)
+      3. (si besoin)         →  sélection manuelle du dossier Photos si non détecté
+      4. Popup de succès     →  confirmation + nom du raccourci créé
 
-    Tout le reste (Backend DB, DEST_PHOTOS, studiovision.exe)
-    est détecté automatiquement, sans solliciter le médecin.
-    DOCUM.MDB n'est pas utilisé par le routeur et n'est plus configuré.
+    Détections automatiques (silencieuses) :
+      - Backend DB       : via COM (propriété .Connect de la table liée "Documents")
+      - DEST_PHOTOS      : heuristique sur l'arborescence réseau (2 niveaux)
+      - SV_CMDLINE/CWD   : psutil capture process.cmdline() + process.cwd() de
+                           MSACCESS.EXE en cours — sauvegardés en JSON dans config.ini
+                           pour permettre un re-lancement à l'identique au démarrage.
+
+    DOCUM.MDB n'est pas utilisé par le routeur et n'est pas configuré.
     """
     root = tk.Tk()
     root.withdraw()
@@ -372,9 +390,15 @@ BACKEND_MDB          = Path(
     config.get("PATHS", "BACKEND_MDB",
                fallback=config.get("PATHS", "PUBLIC_MDB", fallback=""))
 )
-# Commande de lancement de MSACCESS.EXE (liste d'arguments) et répertoire de travail.
-# Rétrocompatibilité : anciens config.ini avec SV_FRONTEND_PATH sont ignorés
-# (l'utilisateur devra reconfigurer une fois pour capturer la vraie cmdline).
+# Commande de lancement de MSACCESS.EXE (liste d'arguments sérialisée en JSON)
+# et répertoire de travail, capturés via psutil lors de la configuration initiale.
+#
+# Rétrocompatibilité :
+#   - Anciens config.ini écrits avec SV_FRONTEND_PATH (chemin simple vers le .mde)
+#     sont implicitement ignorés : cette clé n'est plus lue. L'utilisateur devra
+#     relancer la configuration une fois pour capturer la vraie cmdline complète.
+#   - Si SV_CMDLINE est absent ou invalide, le lancement automatique est désactivé
+#     sans erreur bloquante (log WARNING + SV_CMDLINE = []).
 _sv_cmdline_raw = config.get("PATHS", "SV_CMDLINE", fallback="[]")
 try:
     SV_CMDLINE = json.loads(_sv_cmdline_raw)
@@ -990,7 +1014,7 @@ def main() -> None:
 
     ORPHAN_DIR.mkdir(parents=True, exist_ok=True)
 
-    log.info("Version 5 started")
+    log.info("Version 5 — Lanceur dynamique + Routeur d'images démarré")
     log.info(f"  Source      : {SOURCE_DIR}")
     log.info(f"  Dest        : {DEST_PHOTOS}")
     log.info(f"  BACKEND_MDB : {BACKEND_MDB}")
