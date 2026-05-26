@@ -72,19 +72,51 @@ log = logging.getLogger("image_router")
 
 def get_db_path_from_com() -> "Path | None":
     """
-    Retourne le chemin complet de la base de données actuellement ouverte
-    dans l'instance active de Microsoft Access (via COM).
-    En pratique, cela correspond à PUBLIC.MDB dans Studio Vision.
+    Retourne le chemin réseau absolu du Backend Studio Vision (agnostique du nom
+    de fichier) en lisant la propriété .Connect de la table liée "Documents" via COM.
+
+    La chaîne Connect est de la forme :
+        ;DATABASE=\\\\serveur\\dossier\\fichier\\NOM_DE_LA_BASE.MDB
+    On extrait la partie après "DATABASE=" pour obtenir le chemin réseau réel,
+    quel que soit le nom du fichier backend (PUBLIC.MDB, BASE_2026.ACCDB, etc.).
+
+    Fallback : si la table "Documents" n'est pas liée (installation locale sans
+    table liée), on retourne access.CurrentDb().Name — comportement conservatif.
     """
     if not WIN32_AVAILABLE:
         log.error("win32com non disponible — détection COM impossible.")
         return None
     try:
-        access   = win32com.client.GetActiveObject("Access.Application")
-        db_name  = access.CurrentDb().Name
-        db_path  = Path(db_name)
-        log.info(f"Base de données détectée via COM : {db_path}")
+        access = win32com.client.GetActiveObject("Access.Application")
+        db     = access.CurrentDb()
+
+        # Tentative de lecture du chemin Backend via la table liée "Documents"
+        try:
+            connect_string = db.TableDefs("Documents").Connect
+            if connect_string and "DATABASE=" in connect_string.upper():
+                # Extraction robuste : on cherche "DATABASE=" en insensible à la casse
+                upper = connect_string.upper()
+                idx   = upper.index("DATABASE=") + len("DATABASE=")
+                db_path = Path(connect_string[idx:].strip())
+                log.info(f"Backend DB détecté via .Connect : {db_path}")
+                return db_path
+            else:
+                log.warning(
+                    f"Propriété Connect présente mais sans 'DATABASE=' : "
+                    f"'{connect_string}' — fallback sur CurrentDb().Name"
+                )
+        except Exception as e_connect:
+            log.warning(
+                f"Impossible de lire .Connect sur la table 'Documents' "
+                f"({e_connect}) — fallback sur CurrentDb().Name"
+            )
+
+        # Fallback : chemin du Frontend local (comportement original)
+        db_name = db.Name
+        db_path = Path(db_name)
+        log.info(f"Base de données détectée via COM (fallback Frontend) : {db_path}")
         return db_path
+
     except Exception as e:
         log.debug(f"COM get_db_path échoué : {e}")
         return None
@@ -164,10 +196,12 @@ def configurer_via_interface(config_path: Path) -> None:
 
       1. Une boîte de bienvenue  →  rappel Studio Vision ouvert + annonce filedialog
       2. filedialog               →  sélection du dossier SOURCE
-      3. Popup de succès          →  confirmation + nom du raccourci créé
+      3. (si besoin)              →  sélection manuelle du dossier Photos si non détecté
+      4. Popup de succès          →  confirmation + nom du raccourci créé
 
-    Tout le reste (PUBLIC.MDB, DOCUM.MDB, DEST_PHOTOS, studiovision.exe)
+    Tout le reste (Backend DB, DEST_PHOTOS, studiovision.exe)
     est détecté automatiquement, sans solliciter le médecin.
+    DOCUM.MDB n'est pas utilisé par le routeur et n'est plus configuré.
     """
     root = tk.Tk()
     root.withdraw()
@@ -186,9 +220,9 @@ def configurer_via_interface(config_path: Path) -> None:
     # ------------------------------------------------------------------
     # Détections automatiques (silencieuses pour l'utilisateur)
     # ------------------------------------------------------------------
-    public_mdb = get_db_path_from_com()
+    backend_mdb = get_db_path_from_com()
 
-    if public_mdb is None:
+    if backend_mdb is None:
         messagebox.showerror(
             "Studio Vision introuvable",
             "Studio Vision ne répond pas.\n\n"
@@ -196,14 +230,49 @@ def configurer_via_interface(config_path: Path) -> None:
         )
         sys.exit(1)
 
-    sv_base_dir     = public_mdb.parent
-    docum_mdb       = sv_base_dir / "DOCUM.MDB"
-    dest_photos     = sv_base_dir / "Photos"
+    # ------------------------------------------------------------------
+    # Détection heuristique de dest_photos (architecture variable selon cabinet)
+    #   Test 1 : backend_mdb.parent / "Photos"        (base à la racine du partage)
+    #   Test 2 : backend_mdb.parent.parent / "Photos"  (base dans un sous-dossier)
+    #   Fallback : demander explicitement à l'utilisateur
+    # ------------------------------------------------------------------
+    _candidate1 = backend_mdb.parent / "Photos"
+    _candidate2 = backend_mdb.parent.parent / "Photos"
+
+    if _candidate1.is_dir():
+        dest_photos = _candidate1
+        log.info(f"DEST_PHOTOS détecté (niveau 1) : {dest_photos}")
+    elif _candidate2.is_dir():
+        dest_photos = _candidate2
+        log.info(f"DEST_PHOTOS détecté (niveau 2) : {dest_photos}")
+    else:
+        log.warning(
+            f"Dossier Photos introuvable en '{_candidate1}' ni en '{_candidate2}'. "
+            "Demande manuelle à l'utilisateur."
+        )
+        messagebox.showinfo(
+            "Dossier Photos introuvable",
+            "Le dossier 'Photos' de Studio Vision n'a pas pu être détecté "
+            "automatiquement.\n\n"
+            "Cliquez sur OK, puis sélectionnez ce dossier manuellement."
+        )
+        _photos_manual = filedialog.askdirectory(
+            title="Sélectionnez le dossier Photos de Studio Vision"
+        )
+        if not _photos_manual:
+            messagebox.showerror(
+                "Installation annulée",
+                "Aucun dossier Photos sélectionné.\n"
+                "Relancez l'installation pour recommencer."
+            )
+            sys.exit(1)
+        dest_photos = Path(_photos_manual)
+        log.info(f"DEST_PHOTOS sélectionné manuellement : {dest_photos}")
+
     sv_exe_path     = find_sv_exe_via_psutil()
     sv_exe_path_str = str(sv_exe_path) if sv_exe_path else ""
 
-    log.info(f"PUBLIC.MDB  : {public_mdb}")
-    log.info(f"DOCUM.MDB   : {docum_mdb}")
+    log.info(f"BACKEND_MDB : {backend_mdb}")
     log.info(f"DEST_PHOTOS : {dest_photos}")
     log.info(f"SV exe      : {sv_exe_path_str or '(non détecté)'}")
 
@@ -235,8 +304,7 @@ def configurer_via_interface(config_path: Path) -> None:
         "SOURCE_DIR":             source_dir,
         "ORPHAN_DIR":             orphan_dir,
         "DEST_PHOTOS":            str(dest_photos),
-        "PUBLIC_MDB":             str(public_mdb),
-        "DOCUM_MDB":              str(docum_mdb),
+        "BACKEND_MDB":            str(backend_mdb),
         "STUDIO_VISION_EXE_PATH": sv_exe_path_str,
     }
     cfg["TIMEOUTS"] = {"PATIENT_WAIT_TIMEOUT": "900"}
@@ -278,8 +346,11 @@ DEFAULT_EXAM_NAME      = config.get("GENERAL", "DEFAULT_EXAM_NAME",  fallback="I
 SOURCE_DIR             = Path(config.get("PATHS", "SOURCE_DIR"))
 ORPHAN_DIR             = Path(config.get("PATHS", "ORPHAN_DIR"))
 DEST_PHOTOS            = Path(config.get("PATHS", "DEST_PHOTOS"))
-PUBLIC_MDB             = Path(config.get("PATHS", "PUBLIC_MDB"))
-DOCUM_MDB              = Path(config.get("PATHS", "DOCUM_MDB"))
+# Rétrocompatibilité : anciens config.ini écrits avec la clé "PUBLIC_MDB"
+BACKEND_MDB            = Path(
+    config.get("PATHS", "BACKEND_MDB",
+               fallback=config.get("PATHS", "PUBLIC_MDB", fallback=""))
+)
 # Chemin complet de studiovision.exe (vide = lancement automatique désactivé)
 STUDIO_VISION_EXE_PATH = config.get("PATHS", "STUDIO_VISION_EXE_PATH", fallback="")
 PATIENT_WAIT_TIMEOUT   = config.getint("TIMEOUTS", "PATIENT_WAIT_TIMEOUT", fallback=900)
@@ -404,11 +475,11 @@ def find_patient_folder(patient_code: str) -> "Path | None":
     if not PYODBC_AVAILABLE:
         log.error("pyodbc not available.")
         return None
-    if not PUBLIC_MDB.exists():
-        log.error(f"PUBLIC.MDB not found: {PUBLIC_MDB}")
+    if not BACKEND_MDB.exists():
+        log.error(f"Backend DB not found: {BACKEND_MDB}")
         return None
     try:
-        conn   = db_connect(PUBLIC_MDB)
+        conn   = db_connect(BACKEND_MDB)
         cursor = conn.cursor()
         cursor.execute(
             "SELECT TOP 1 [Photo externe] FROM Documents "
@@ -443,11 +514,11 @@ def insert_document(patient: dict, relative_path: str, description: str) -> bool
     if not PYODBC_AVAILABLE:
         log.warning("pyodbc not available, insert skipped.")
         return False
-    if not PUBLIC_MDB.exists():
-        log.error("PUBLIC.MDB not found, insert skipped.")
+    if not BACKEND_MDB.exists():
+        log.error("Backend DB not found, insert skipped.")
         return False
     try:
-        conn   = db_connect(PUBLIC_MDB)
+        conn   = db_connect(BACKEND_MDB)
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -459,7 +530,7 @@ def insert_document(patient: dict, relative_path: str, description: str) -> bool
         )
         conn.commit()
         conn.close()
-        log.info(f"Insert OK: patient={patient['code']} path='{relative_path}' db={PUBLIC_MDB.name}")
+        log.info(f"Insert OK: patient={patient['code']} path='{relative_path}' db={BACKEND_MDB.name}")
         return True
     except Exception as e:
         log.error(f"DB insert failed: {e}")
@@ -884,14 +955,14 @@ def main() -> None:
     ORPHAN_DIR.mkdir(parents=True, exist_ok=True)
 
     log.info("Version 5 started")
-    log.info(f"  Source     : {SOURCE_DIR}")
-    log.info(f"  Dest       : {DEST_PHOTOS}")
-    log.info(f"  PUBLIC.MDB : {PUBLIC_MDB}")
-    log.info(f"  SV exe     : {STUDIO_VISION_EXE_PATH or '(non configuré)'}")
-    log.info(f"  Orphans    : {ORPHAN_DIR}")
-    log.info(f"  Log file   : {_LOG_FILE}")
-    log.info(f"  Timeout    : {PATIENT_WAIT_TIMEOUT // 60} min")
-    log.info(f"  Ext        : {', '.join(sorted(WATCHED_EXTENSIONS))}")
+    log.info(f"  Source      : {SOURCE_DIR}")
+    log.info(f"  Dest        : {DEST_PHOTOS}")
+    log.info(f"  BACKEND_MDB : {BACKEND_MDB}")
+    log.info(f"  SV exe      : {STUDIO_VISION_EXE_PATH or '(non configuré)'}")
+    log.info(f"  Orphans     : {ORPHAN_DIR}")
+    log.info(f"  Log file    : {_LOG_FILE}")
+    log.info(f"  Timeout     : {PATIENT_WAIT_TIMEOUT // 60} min")
+    log.info(f"  Ext         : {', '.join(sorted(WATCHED_EXTENSIONS))}")
 
     # ------------------------------------------------------------------
     # 4. Démarrage des threads de surveillance
