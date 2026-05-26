@@ -34,6 +34,7 @@ from datetime import datetime
 from pathlib import Path
 from watchdog.observers.polling import PollingObserver as Observer
 from watchdog.events import FileSystemEventHandler
+
 try:
     import win32com.client
     WIN32_AVAILABLE = True
@@ -53,6 +54,7 @@ except ImportError:
 import win32api
 import win32event
 import winerror
+
 # --- INITIALISATION DES LOGS ---
 _LOG_DIR  = Path(os.path.expanduser("~")) / "studiovision"
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -67,6 +69,7 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("image_router")
+
 # ---------------------------------------------------------------------------
 #  HELPERS DE CONFIGURATION AUTOMATIQUE
 # ---------------------------------------------------------------------------
@@ -74,12 +77,6 @@ def get_db_path_from_com() -> "Path | None":
     """
     Retourne le chemin réseau absolu du Backend Studio Vision (agnostique du nom
     de fichier) en lisant la propriété .Connect de la table liée "Documents" via COM.
-    La chaîne Connect est de la forme :
-        ;DATABASE=\\\\serveur\\dossier\\fichier\\NOM_DE_LA_BASE.MDB
-    On extrait la partie après "DATABASE=" pour obtenir le chemin réseau réel,
-    quel que soit le nom du fichier backend (PUBLIC.MDB, BASE_2026.ACCDB, etc.).
-    Fallback : si la table "Documents" n'est pas liée (installation locale sans
-    table liée), on retourne access.CurrentDb().Name — comportement conservatif.
     """
     if not WIN32_AVAILABLE:
         log.error("win32com non disponible — détection COM impossible.")
@@ -91,7 +88,6 @@ def get_db_path_from_com() -> "Path | None":
         try:
             connect_string = db.TableDefs("Documents").Connect
             if connect_string and "DATABASE=" in connect_string.upper():
-                # Extraction robuste : on cherche "DATABASE=" en insensible à la casse
                 upper = connect_string.upper()
                 idx   = upper.index("DATABASE=") + len("DATABASE=")
                 db_path = Path(connect_string[idx:].strip())
@@ -115,16 +111,10 @@ def get_db_path_from_com() -> "Path | None":
     except Exception as e:
         log.debug(f"COM get_db_path échoué : {e}")
         return None
+
 def lire_raccourci_lnk(lnk_path: str) -> "tuple[str, str, str] | tuple[None, None, None]":
     """
-    Lit un fichier raccourci Windows (.lnk) via WScript.Shell et extrait :
-      - TargetPath      : chemin complet de l'exécutable cible
-      - Arguments       : arguments de lancement (ex: /wrkgrp ... /User om ...)
-      - WorkingDirectory: dossier de démarrage
-    Ces 3 valeurs permettent de recréer un lancement 100 % identique au
-    double-clic sur le raccourci d'origine, y compris les arguments sensibles
-    (groupes de travail, utilisateur, etc.) qui ne sont jamais masqués dans
-    le fichier .lnk, contrairement à la ligne de commande système.
+    Lit un fichier raccourci Windows (.lnk) via WScript.Shell.
     Retourne (target, args, cwd) ou (None, None, None) en cas d'erreur.
     """
     if not WIN32_AVAILABLE:
@@ -144,18 +134,64 @@ def lire_raccourci_lnk(lnk_path: str) -> "tuple[str, str, str] | tuple[None, Non
     except Exception as e:
         log.error(f"Lecture du raccourci .lnk échouée ({lnk_path}) : {e}")
         return None, None, None
+
+def auto_detect_sv_shortcut(frontend_path: str) -> "str | None":
+    """
+    Scanne les bureaux (Utilisateur et Public) pour trouver le raccourci .lnk
+    qui lance le frontend spécifique.
+    Retourne le chemin absolu du raccourci si EXACTEMENT UN candidat est trouvé.
+    """
+    if not WIN32_AVAILABLE:
+        return None
+
+    try:
+        shell = win32com.client.Dispatch("WScript.Shell")
+        user_desktop = shell.SpecialFolders("Desktop")
+        public_desktop = shell.SpecialFolders("AllUsersDesktop")
+        
+        search_dirs = [user_desktop]
+        if public_desktop and public_desktop not in search_dirs:
+            search_dirs.append(public_desktop)
+
+        candidates = []
+        frontend_lower = str(frontend_path).lower()
+
+        log.info(f"Auto-détection du raccourci pour : {frontend_path}")
+
+        for directory in search_dirs:
+            if not directory or not os.path.exists(directory):
+                continue
+            for filename in os.listdir(directory):
+                if filename.lower().endswith(".lnk"):
+                    lnk_path = os.path.join(directory, filename)
+                    try:
+                        shortcut = shell.CreateShortcut(lnk_path)
+                        target = str(shortcut.TargetPath or "").lower()
+                        args = str(shortcut.Arguments or "").lower()
+                        
+                        if frontend_lower in target or frontend_lower in args:
+                            candidates.append(lnk_path)
+                            log.info(f"Candidat trouvé : {lnk_path}")
+                    except Exception as e:
+                        log.debug(f"Erreur lecture .lnk {lnk_path}: {e}")
+
+        if len(candidates) == 1:
+            log.info(f"Succès auto-détection: {candidates[0]}")
+            return candidates[0]
+        elif len(candidates) > 1:
+            log.warning("Multiples candidats trouvés, auto-détection annulée.")
+        else:
+            log.info("Aucun candidat trouvé sur les bureaux.")
+            
+        return None
+
+    except Exception as e:
+        log.warning(f"Erreur lors de l'auto-détection: {e}")
+        return None
+
+
 def create_desktop_shortcut(target_exe: Path) -> None:
-    """
-    Crée un raccourci '.lnk' nommé 'Studio Vision - Connected'
-    sur le Bureau de l'utilisateur courant.
-    L'icône utilisée est celle embarquée dans target_exe (le routeur compilé).
-    Aucune tentative d'emprunter l'icône d'un .mde / .mdb tiers, car ces
-    fichiers ne contiennent pas d'icônes extractibles par WScript.Shell.
-    Paramètres
-    ----------
-    target_exe : Path
-        Chemin vers l'exécutable du routeur (studiovision_monitor_AL.exe).
-    """
+    """Crée le nouveau raccourci 'Studio Vision - Connected'."""
     if not WIN32_AVAILABLE:
         log.warning("win32com non disponible — création du raccourci ignorée.")
         return
@@ -167,78 +203,24 @@ def create_desktop_shortcut(target_exe: Path) -> None:
         shortcut.TargetPath       = str(target_exe)
         shortcut.WorkingDirectory = str(target_exe.parent)
         shortcut.Description      = "Lance Studio Vision avec le routeur d'images intégré"
-        # Icône : icône par défaut de l'exécutable compilé (index 0)
         shortcut.IconLocation     = f"{target_exe}, 0"
         shortcut.save()
         log.info(f"Raccourci Bureau créé : {lnk_path}")
     except Exception as e:
         log.error(f"Impossible de créer le raccourci Bureau : {e}")
+
 # ---------------------------------------------------------------------------
 #  INTERFACE DE CONFIGURATION (PREMIÈRE INSTALLATION)
 # ---------------------------------------------------------------------------
 def configurer_via_interface(config_path: Path) -> None:
     """
-    Première configuration — flux UX minimal : 3 interactions seulement.
-      1. Popup de bienvenue     →  invite à sélectionner le raccourci Studio Vision
-      2. filedialog (.lnk)      →  sélection du raccourci Studio Vision habituel
-      3. filedialog (dossier)   →  sélection du dossier SOURCE (appareil photo)
-      4. (si besoin)            →  sélection manuelle du dossier Photos si non détecté
-      5. Popup de succès        →  confirmation + nom du raccourci créé
-    Détections automatiques (silencieuses) :
-      - Backend DB       : via COM (propriété .Connect de la table liée "Documents")
-      - DEST_PHOTOS      : heuristique sur l'arborescence réseau (2 niveaux)
-      - SV_TARGET/ARGS/CWD : lecture du fichier .lnk via WScript.Shell
-    DOCUM.MDB n'est pas utilisé par le routeur et n'est pas configuré.
+    Première configuration (Mode Silencieux & Auto-détection).
     """
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
-    # ------------------------------------------------------------------
-    # ÉTAPE 1 — Sélection du raccourci Studio Vision (.lnk)
-    # ------------------------------------------------------------------
-    messagebox.showinfo(
-        "Configuration du Routeur d'Images",
-        "Pour relier les logiciels, veuillez sélectionner votre raccourci\n"
-        "'Studio Vision' habituel (celui que vous utilisez tous les jours\n"
-        "sur votre Bureau).\n\n"
-        "Cliquez sur OK pour choisir ce raccourci."
-    )
-    lnk_path = filedialog.askopenfilename(
-        title="Sélectionnez le raccourci Studio Vision",
-        filetypes=[("Raccourci Windows", "*.lnk")],
-    )
-    if not lnk_path:
-        messagebox.showerror(
-            "Installation annulée",
-            "Aucun raccourci sélectionné.\n"
-            "Relancez l'installation pour recommencer."
-        )
-        sys.exit(1)
-    sv_target, sv_args, sv_cwd = lire_raccourci_lnk(lnk_path)
-    if not sv_target:
-        messagebox.showerror(
-            "Raccourci illisible",
-            "Impossible de lire les propriétés du raccourci sélectionné.\n\n"
-            "Assurez-vous de sélectionner un fichier .lnk valide\n"
-            "pointant vers Studio Vision, puis relancez l'installation."
-        )
-        sys.exit(1)
-    log.info(f"SV_TARGET : {sv_target}")
-    log.info(f"SV_ARGS   : {sv_args}")
-    log.info(f"SV_CWD    : {sv_cwd or '(vide)'}")
-    # ------------------------------------------------------------------
-    # Détections automatiques (silencieuses pour l'utilisateur)
-    # ------------------------------------------------------------------
-    messagebox.showinfo(
-        "Configuration du Routeur d'Images",
-        "Raccourci enregistré avec succès.\n\n"
-        "Avant de continuer, vérifiez le point suivant :\n\n"
-        "Studio Vision doit être actuellement OUVERT\n"
-        "EN MODE ADMINISTRATEUR.\n"
-        "(Sans cela, la liaison avec la base de données\n"
-        "ne pourra pas être établie automatiquement.)\n\n"
-        "Cliquez sur OK une fois Studio Vision ouvert."
-    )
+
+    # 1. Connecter COM pour trouver le frontend et le backend
     backend_mdb = get_db_path_from_com()
     if backend_mdb is None:
         messagebox.showerror(
@@ -247,12 +229,56 @@ def configurer_via_interface(config_path: Path) -> None:
             "Ouvrez Studio Vision, puis relancez l'installation."
         )
         sys.exit(1)
-    # ------------------------------------------------------------------
-    # Détection heuristique de dest_photos (architecture variable selon cabinet)
-    #   Test 1 : backend_mdb.parent / "Photos"        (base à la racine du partage)
-    #   Test 2 : backend_mdb.parent.parent / "Photos"  (base dans un sous-dossier)
-    #   Fallback : demander explicitement à l'utilisateur
-    # ------------------------------------------------------------------
+
+    # Récupérer explicitement le frontend actuel pour la recherche de raccourci
+    frontend_path = None
+    try:
+        access = win32com.client.GetActiveObject("Access.Application")
+        frontend_path = access.CurrentDb().Name
+    except Exception:
+        log.warning("Impossible de lire CurrentDb().Name pour l'auto-détection.")
+
+    # 2. Détection du raccourci .lnk
+    sv_target, sv_args, sv_cwd = None, None, None
+    lnk_path = None
+    
+    if frontend_path:
+        lnk_path = auto_detect_sv_shortcut(frontend_path)
+
+    if lnk_path:
+        sv_target, sv_args, sv_cwd = lire_raccourci_lnk(lnk_path)
+        
+    # Fallback : demander manuellement si l'auto-détection a échoué
+    if not sv_target:
+        messagebox.showinfo(
+            "Raccourci introuvable",
+            "La détection automatique du raccourci a échoué.\n\n"
+            "Veuillez sélectionner votre raccourci 'Studio Vision' habituel."
+        )
+        lnk_path_manual = filedialog.askopenfilename(
+            title="Sélectionnez le raccourci Studio Vision",
+            filetypes=[("Raccourci Windows", "*.lnk")],
+        )
+        if not lnk_path_manual:
+            messagebox.showerror(
+                "Installation annulée",
+                "Aucun raccourci sélectionné.\nRelancez l'installation pour recommencer."
+            )
+            sys.exit(1)
+            
+        sv_target, sv_args, sv_cwd = lire_raccourci_lnk(lnk_path_manual)
+        if not sv_target:
+            messagebox.showerror(
+                "Raccourci illisible",
+                "Impossible de lire le raccourci.\nRelancez l'installation."
+            )
+            sys.exit(1)
+
+    log.info(f"SV_TARGET : {sv_target}")
+    log.info(f"SV_ARGS   : {sv_args}")
+    log.info(f"SV_CWD    : {sv_cwd or '(vide)'}")
+
+    # 3. Détection de DEST_PHOTOS
     _candidate1 = backend_mdb.parent / "Photos"
     _candidate2 = backend_mdb.parent.parent / "Photos"
     if _candidate1.is_dir():
@@ -262,14 +288,10 @@ def configurer_via_interface(config_path: Path) -> None:
         dest_photos = _candidate2
         log.info(f"DEST_PHOTOS détecté (niveau 2) : {dest_photos}")
     else:
-        log.warning(
-            f"Dossier Photos introuvable en '{_candidate1}' ni en '{_candidate2}'. "
-            "Demande manuelle à l'utilisateur."
-        )
+        log.warning("Dossier Photos introuvable. Demande manuelle à l'utilisateur.")
         messagebox.showinfo(
             "Dossier Photos introuvable",
-            "Le dossier 'Photos' de Studio Vision n'a pas pu être détecté "
-            "automatiquement.\n\n"
+            "Le dossier 'Photos' de Studio Vision n'a pas pu être détecté automatiquement.\n\n"
             "Cliquez sur OK, puis sélectionnez ce dossier manuellement."
         )
         _photos_manual = filedialog.askdirectory(
@@ -278,32 +300,27 @@ def configurer_via_interface(config_path: Path) -> None:
         if not _photos_manual:
             messagebox.showerror(
                 "Installation annulée",
-                "Aucun dossier Photos sélectionné.\n"
-                "Relancez l'installation pour recommencer."
+                "Aucun dossier Photos sélectionné.\nRelancez l'installation."
             )
             sys.exit(1)
         dest_photos = Path(_photos_manual)
         log.info(f"DEST_PHOTOS sélectionné manuellement : {dest_photos}")
-    log.info(f"BACKEND_MDB : {backend_mdb}")
-    log.info(f"DEST_PHOTOS : {dest_photos}")
-    # ------------------------------------------------------------------
-    # ÉTAPE 2 — Sélection du dossier SOURCE (appareil photo)
-    # ------------------------------------------------------------------
+
+    # 4. Demander le dossier SOURCE (La seule étape visuelle normale)
     source_dir = filedialog.askdirectory(
-        title="Sélectionnez le dossier de l'appareil photo"
+        title="Dernière étape : Sélectionnez le dossier de votre appareil photo"
     )
     if not source_dir:
         messagebox.showerror(
             "Installation annulée",
-            "Aucun dossier sélectionné.\n"
-            "Relancez l'installation pour recommencer."
+            "Aucun dossier sélectionné.\nRelancez l'installation pour recommencer."
         )
         sys.exit(1)
+
     _desktop = Path(win32com.client.Dispatch("WScript.Shell").SpecialFolders("Desktop"))
     orphan_dir = str(_desktop / "Orphelins")
-    # ------------------------------------------------------------------
-    # Écriture du config.ini  (silencieux)
-    # ------------------------------------------------------------------
+
+    # 5. Écriture du config.ini
     cfg = configparser.ConfigParser()
     cfg["GENERAL"] = {
         "BOX_NAME":          "StudioVision Monitor",
@@ -322,55 +339,48 @@ def configurer_via_interface(config_path: Path) -> None:
     with open(config_path, "w", encoding="utf-8") as f:
         cfg.write(f)
     log.info(f"config.ini écrit dans : {config_path}")
-    # Création du raccourci Bureau  (silencieuse — icône par défaut du .exe)
+
+    # 6. Création du raccourci Bureau
     own_exe = Path(sys.executable) if getattr(sys, "frozen", False) else Path(__file__).resolve()
     create_desktop_shortcut(own_exe)
-    # ------------------------------------------------------------------
-    # ÉTAPE 3 — Confirmation : courte, lisible, actionnable
-    # ------------------------------------------------------------------
+
+    # 7. Confirmation finale
     messagebox.showinfo(
         "Installation terminée !",
         "Installation terminée avec succès !\n\n"
         "ACTION REQUISE :\n"
         "Veuillez maintenant FERMER la fenêtre Studio Vision\n"
-        "actuellement ouverte (mode administrateur).\n\n"
+        "actuellement ouverte.\n\n"
         "Pour travailler, utilisez désormais uniquement\n"
         "le raccourci  'Studio Vision - Connected'\n"
         "créé sur votre Bureau."
     )
     root.destroy()
+
 # ---------------------------------------------------------------------------
 #  CHARGEMENT DE LA CONFIGURATION
 # ---------------------------------------------------------------------------
-# Résolution du dossier de base : dossier du .exe en mode compilé (PyInstaller),
-# dossier du .py en mode source. sys._MEIPASS (dossier temporaire de décompression)
-# n'est volontairement PAS utilisé — le config.ini doit persister entre les lancements.
 if getattr(sys, "frozen", False):
     _base_dir = Path(sys.executable).parent
 else:
     _base_dir = Path(__file__).resolve().parent
 _config_path = _base_dir / "config.ini"
+
 if not _config_path.exists():
     configurer_via_interface(_config_path)
+
 config = configparser.ConfigParser()
 config.read(_config_path, encoding="utf-8")
+
 BOX_NAME             = config.get("GENERAL", "BOX_NAME",          fallback="StudioVision Monitor")
 DEFAULT_EXAM_NAME    = config.get("GENERAL", "DEFAULT_EXAM_NAME", fallback="Image")
 SOURCE_DIR           = Path(config.get("PATHS", "SOURCE_DIR"))
 ORPHAN_DIR           = Path(config.get("PATHS", "ORPHAN_DIR"))
 DEST_PHOTOS          = Path(config.get("PATHS", "DEST_PHOTOS"))
-# Rétrocompatibilité : anciens config.ini écrits avec la clé "PUBLIC_MDB"
 BACKEND_MDB          = Path(
     config.get("PATHS", "BACKEND_MDB",
                fallback=config.get("PATHS", "PUBLIC_MDB", fallback=""))
 )
-# Paramètres de lancement de Studio Vision — lus depuis le raccourci .lnk
-# à l'installation initiale via lire_raccourci_lnk().
-#   SV_TARGET : chemin de l'exécutable (ex: C:\...\MSACCESS.EXE)
-#   SV_ARGS   : arguments bruts (ex: /wrkgrp system.mdw /User om /X demarrage)
-#   SV_CWD    : dossier de démarrage (WorkingDirectory du raccourci .lnk)
-# Rétrocompatibilité : les anciens config.ini avec SV_CMDLINE ou SV_FRONTEND_PATH
-# ne sont plus lus — l'utilisateur devra relancer la configuration une fois.
 SV_TARGET = config.get("PATHS", "SV_TARGET", fallback="").strip()
 SV_ARGS   = config.get("PATHS", "SV_ARGS",   fallback="").strip()
 SV_CWD    = config.get("PATHS", "SV_CWD",    fallback="").strip()
@@ -378,13 +388,7 @@ SV_CWD    = config.get("PATHS", "SV_CWD",    fallback="").strip()
 # ---------------------------------------------------------------------------
 #  CONSTANTES OPÉRATIONNELLES
 # ---------------------------------------------------------------------------
-# Timeout (en secondes) pendant lequel le worker attend qu'un patient soit
-# ouvert dans Studio Vision avant d'orpheliner le fichier.
-# Valeur par défaut : 900 s (15 min). Surchargeable dans config.ini [TIMEOUTS].
 PATIENT_WAIT_TIMEOUT = config.getint("TIMEOUTS", "PATIENT_WAIT_TIMEOUT", fallback=900)
-
-# Nom du processus Microsoft Access surveillé pour détecter si Studio Vision
-# est en cours d'exécution (Studio Vision est un Frontend Access .mde/.mdb).
 _MSACCESS_EXE = "MSACCESS.EXE"
 
 WATCHED_EXTENSIONS     = {".jpg", ".jpeg", ".jfif", ".png", ".bmp", ".tif", ".tiff",
@@ -404,6 +408,7 @@ _icon: "pystray.Icon | None" = None
 _status_text: str             = "Starting..."
 _stop_event: threading.Event  = threading.Event()
 _mutex_handle = None
+
 def _make_icon(color: tuple) -> "Image.Image":
     img  = Image.new("RGBA", (_ICON_SIZE, _ICON_SIZE), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -818,10 +823,6 @@ def _run_background(file_queue: queue.Queue) -> None:
 def _is_sv_running() -> bool:
     """
     Retourne True si MSACCESS.EXE est actuellement en cours d'exécution.
-    Studio Vision étant un Frontend Access (.mde/.mdb), c'est toujours
-    MSACCESS.EXE qui est le processus réel à surveiller.
-    Utilise WMIC (disponible sur tout Windows sans dépendance tierce)
-    plutôt que psutil, pour rester Zéro-Config en termes de dépendances.
     """
     try:
         result = subprocess.run(
@@ -834,18 +835,12 @@ def _is_sv_running() -> bool:
     except Exception as e:
         log.warning(f"Impossible de vérifier si MSACCESS.EXE tourne : {e}")
         return False
+
 def _ensure_sv_running() -> None:
     """
     Vérifie si MSACCESS.EXE est ouvert.
     S'il ne l'est pas et que SV_TARGET est configuré, relance Studio Vision
-    exactement comme un double-clic sur le raccourci d'origine :
-      - SV_TARGET : chemin de l'exécutable (issu du raccourci .lnk)
-      - SV_ARGS   : arguments bruts (ex: /wrkgrp ... /User om /Pwd xxx /X demarrage)
-      - SV_CWD    : dossier de démarrage (WorkingDirectory du raccourci .lnk)
-    La commande est construite sous forme de chaîne entourée de guillemets
-    pour gérer les chemins avec espaces, puis passée à subprocess.Popen
-    avec shell=True afin que Windows la parse exactement comme cmd.exe le
-    ferait lors du double-clic sur le raccourci.
+    exactement comme un double-clic sur le raccourci d'origine.
     """
     if _is_sv_running():
         log.info("MSACCESS.EXE est déjà en cours d'exécution.")
@@ -856,9 +851,6 @@ def _ensure_sv_running() -> None:
             "lancement automatique de Studio Vision désactivé."
         )
         return
-    # Construction de la commande complète : '"chemin\exe" arguments'
-    # Les guillemets autour de SV_TARGET gèrent les espaces dans le chemin.
-    # SV_ARGS est ajouté tel quel, exactement comme dans le raccourci .lnk.
     cmd = f'"{SV_TARGET}"'
     if SV_ARGS:
         cmd = f'{cmd} {SV_ARGS}'
@@ -867,13 +859,12 @@ def _ensure_sv_running() -> None:
     try:
         subprocess.Popen(
             cmd,
-            cwd=SV_CWD or None,   # None = héritage du cwd courant si vide
-            shell=True,           # nécessaire pour que Windows parse la cmdline correctement
+            cwd=SV_CWD or None,
+            shell=True,
         )
     except Exception as e:
         log.error(f"Impossible de relancer Studio Vision : {e}")
         return
-    # Attente active : jusqu'à 30 s pour qu'MSACCESS.EXE apparaisse
     _SV_LAUNCH_TIMEOUT = 30
     for elapsed in range(_SV_LAUNCH_TIMEOUT):
         time.sleep(1)
@@ -889,27 +880,13 @@ def _ensure_sv_running() -> None:
 # ---------------------------------------------------------------------------
 def main() -> None:
     global _icon, _mutex_handle
-    # ------------------------------------------------------------------
-    # 1. Garde single-instance : quitter silencieusement si déjà actif.
-    #    Ce mutex est le seul mécanisme anti-doublon — il couvre tous les
-    #    scénarios (double-clic sur le raccourci, relance, etc.).
-    # ------------------------------------------------------------------
     _mutex_handle = win32event.CreateMutex(None, False, "ImageRouter_StudioVision_Mutex")
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
         log.info("Instance déjà en cours — vérification de Studio Vision avant arrêt.")
-        # Le routeur tourne déjà en tray, mais l'utilisateur a peut-être fermé
-        # Studio Vision manuellement. On s'assure qu'il est rouvert avant de quitter.
         _ensure_sv_running()
         log.info("Arrêt silencieux du processus doublon.")
         sys.exit(0)
-    # ------------------------------------------------------------------
-    # 2. Lancer Studio Vision si nécessaire.
-    #    Appelé dès le démarrage via le raccourci 'Studio Vision - Connected'.
-    # ------------------------------------------------------------------
     _ensure_sv_running()
-    # ------------------------------------------------------------------
-    # 3. Vérifications de démarrage
-    # ------------------------------------------------------------------
     prevent_sleep()
     if not SOURCE_DIR.exists():
         log.critical(f"Source folder not found: {SOURCE_DIR}")
@@ -926,9 +903,6 @@ def main() -> None:
     log.info(f"  Log file    : {_LOG_FILE}")
     log.info(f"  Timeout     : {PATIENT_WAIT_TIMEOUT // 60} min")
     log.info(f"  Ext         : {', '.join(sorted(WATCHED_EXTENSIONS))}")
-    # ------------------------------------------------------------------
-    # 4. Démarrage des threads de surveillance
-    # ------------------------------------------------------------------
     file_queue: queue.Queue = queue.Queue()
     threading.Thread(
         target=worker, args=(file_queue,), name="Worker", daemon=True
@@ -936,9 +910,6 @@ def main() -> None:
     threading.Thread(
         target=_run_background, args=(file_queue,), name="Background", daemon=True
     ).start()
-    # ------------------------------------------------------------------
-    # 5. Icône système (system tray)
-    # ------------------------------------------------------------------
     if not TRAY_AVAILABLE:
         log.warning("pystray/Pillow not available — running without system tray.")
         try:

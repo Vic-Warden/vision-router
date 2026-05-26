@@ -2,22 +2,17 @@
 title Installation - Routeur Studio Vision
 cls
 
-:: Force le script a travailler dans son propre dossier (corrige le bug du mode Administrateur)
+:: Force le script a travailler dans son propre dossier
 cd /d "%~dp0"
 
 :: ====================================================================
-:: 1. VERIFICATION DES DROITS ADMINISTRATEUR
+:: 1. AUTO-ELEVATION ADMINISTRATEUR (Zero-Click)
 :: ====================================================================
 net session >nul 2>&1
 if %errorLevel% neq 0 (
-    echo ====================================================================
-    echo   ERREUR : Droits d'administrateur requis !
-    echo ====================================================================
-    echo.
-    echo 1. Faites un CLIC DROIT sur ce fichier
-    echo 2. Choisissez 'Executer en tant qu'administrateur'
-    echo.
-    pause
+    echo L'installation necessite les droits d'administrateur.
+    echo Veuillez cliquer sur "Oui" dans la fenetre de securite qui va s'afficher...
+    powershell -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
     exit /b
 )
 
@@ -61,21 +56,12 @@ echo.
 :: ====================================================================
 echo [3/3] Lancement de la configuration initiale...
 echo.
-echo  ^>^>^> Assurez-vous que Studio Vision est ouvert avant de continuer ^<^<^<
-echo.
 echo ====================================================================
 echo   INSTALLATION DES FICHIERS TERMINEE
 echo ====================================================================
 echo.
-echo L'application va s'ouvrir pour finaliser la configuration.
-echo Repondez aux questions a l'ecran (une seule selection de dossier).
-echo.
-echo Un raccourci 'Studio Vision - Connected' sera automatiquement
-echo cree sur le Bureau a la fin de la configuration.
+echo Veuillez suivre les dernieres instructions a l'ecran.
 echo.
 
 start "" "%TARGET_DIR%\studiovision_monitor_AL.exe"
-
-echo Appuyez sur une touche pour fermer cette fenetre noire d'installation...
-pause >nul
 exit
