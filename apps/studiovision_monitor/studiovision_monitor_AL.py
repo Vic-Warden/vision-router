@@ -203,7 +203,11 @@ def configurer_via_interface(config_path: Path) -> None:
     # ------------------------------------------------------------------
     messagebox.showinfo(
         "Configuration du Routeur d'Images",
-        "1.  Assurez-vous que Studio Vision est actuellement OUVERT.\n\n"
+        "Avant de continuer, vérifiez les deux points suivants :\n\n"
+        "1.  Studio Vision doit être actuellement OUVERT\n"
+        "     EN MODE ADMINISTRATEUR.\n"
+        "     (Sans cela, la liaison avec la base de données\n"
+        "     ne pourra pas être établie automatiquement.)\n\n"
         "2.  Cliquez sur OK pour sélectionner le dossier\n"
         "     où votre appareil photo envoie les images."
     )
@@ -286,7 +290,8 @@ def configurer_via_interface(config_path: Path) -> None:
         )
         sys.exit(1)
 
-    orphan_dir = str(Path(source_dir) / "Orphelins")
+    _desktop = Path(win32com.client.Dispatch("WScript.Shell").SpecialFolders("Desktop"))
+    orphan_dir = str(_desktop / "Orphelins")
 
     # ------------------------------------------------------------------
     # Écriture du config.ini  (silencieux)
@@ -318,9 +323,13 @@ def configurer_via_interface(config_path: Path) -> None:
     # ------------------------------------------------------------------
     messagebox.showinfo(
         "Installation terminée !",
-        "Le raccourci  'Studio Vision - Connected'  a été créé\n"
-        "sur votre Bureau.\n\n"
-        "Utilisez-le désormais pour lancer votre logiciel."
+        "Installation terminée avec succès !\n\n"
+        "ACTION REQUISE :\n"
+        "Veuillez maintenant FERMER la fenêtre Studio Vision\n"
+        "actuellement ouverte (mode administrateur).\n\n"
+        "Pour travailler, utilisez désormais uniquement\n"
+        "le raccourci  'Studio Vision - Connected'\n"
+        "créé sur votre Bureau."
     )
     root.destroy()
 
@@ -949,7 +958,11 @@ def main() -> None:
     # ------------------------------------------------------------------
     _mutex_handle = win32event.CreateMutex(None, False, "ImageRouter_StudioVision_Mutex")
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
-        log.info("Instance déjà en cours — arrêt silencieux.")
+        log.info("Instance déjà en cours — vérification de Studio Vision avant arrêt.")
+        # Le routeur tourne déjà en tray, mais l'utilisateur a peut-être fermé
+        # Studio Vision manuellement. On s'assure qu'il est rouvert avant de quitter.
+        _ensure_sv_running()
+        log.info("Arrêt silencieux du processus doublon.")
         sys.exit(0)
 
     # ------------------------------------------------------------------
