@@ -46,24 +46,8 @@ if exist "studiovision_monitor_AL.exe" (
     copy /y "studiovision_monitor_AL.exe" "%TARGET_DIR%\studiovision_monitor_AL.exe" >nul
     echo [OK] Application copiee dans : %TARGET_DIR%
 ) else (
-    cls
-    echo.
-    echo  ***********************************************************
-    echo  *                                                         *
-    echo  *   ATTENTION : FICHIER ZIP NON EXTRAIT !                 *
-    echo  *                                                         *
-    echo  *   Vous avez lance l'installation directement            *
-    echo  *   depuis l'interieur du fichier ZIP.                    *
-    echo  *                                                         *
-    echo  *   QUE FAIRE :                                           *
-    echo  *   1. Fermez cette fenetre.                              *
-    echo  *   2. Faites un CLIC DROIT sur le fichier ZIP.           *
-    echo  *   3. Choisissez  "Extraire tout..."                     *
-    echo  *   4. Ouvrez le dossier extrait.                         *
-    echo  *   5. Relancez  INSTALLATION_AUTOMATIQUE.bat             *
-    echo  *                                                         *
-    echo  ***********************************************************
-    echo.
+    echo [ERREUR] Le fichier 'studiovision_monitor_AL.exe' est introuvable !
+    echo Assurez-vous d'avoir telecharge les 3 fichiers dans le meme dossier.
     pause
     exit /b
 )
