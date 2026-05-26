@@ -2,6 +2,9 @@
 title Installation - Routeur Studio Vision
 cls
 
+:: Force le script a travailler dans son propre dossier (corrige le bug du mode Administrateur)
+cd /d "%~dp0"
+
 :: ====================================================================
 :: 1. VERIFICATION DES DROITS ADMINISTRATEUR
 :: ====================================================================
@@ -55,15 +58,10 @@ echo.
 
 :: ====================================================================
 :: 4. LANCEMENT POUR CONFIGURATION INITIALE
-::    Le programme va :
-::      - Se connecter a Studio Vision (ouvert) via COM
-::      - Detecter automatiquement PUBLIC.MDB, DOCUM.MDB, studiovision.exe
-::      - Demander uniquement le dossier SOURCE a l'utilisateur
-::      - Creer le raccourci 'Studio Vision - Connected' sur le Bureau
 :: ====================================================================
 echo [3/3] Lancement de la configuration initiale...
 echo.
-echo  >>> Assurez-vous que Studio Vision est ouvert avant de continuer <<<
+echo  ^>^>^> Assurez-vous que Studio Vision est ouvert avant de continuer ^<^<^<
 echo.
 echo ====================================================================
 echo   INSTALLATION DES FICHIERS TERMINEE
@@ -78,5 +76,6 @@ echo.
 
 start "" "%TARGET_DIR%\studiovision_monitor_AL.exe"
 
-timeout /t 5 >nul
+echo Appuyez sur une touche pour fermer cette fenetre noire d'installation...
+pause >nul
 exit
