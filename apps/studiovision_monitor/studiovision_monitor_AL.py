@@ -942,10 +942,14 @@ def main() -> None:
         pystray.MenuItem("Open logs", _open_logs),
         pystray.MenuItem("Quit", _quit),
     )
-    if ICON_PATH.exists():
-        tray_image = Image.open(str(ICON_PATH))
-    else:
-        tray_image = _make_icon(_COLOR_READY)  # Fallback if .ico is missing
+    try:
+        if ICON_PATH.exists():
+            tray_image = Image.open(str(ICON_PATH))
+        else:
+            tray_image = _make_icon(_COLOR_READY)
+    except Exception as e:
+        log.warning(f"Impossible de charger l'icône {ICON_PATH} ({e}) — icône de secours utilisée.")
+        tray_image = _make_icon(_COLOR_READY)
     _icon = pystray.Icon(
         name=BOX_NAME,
         icon=tray_image,
