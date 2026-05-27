@@ -1,73 +1,64 @@
 @echo off
-title Installation - Routeur Studio Vision
+title Studio Vision Router - Installation
 cls
 
-:: Force le script a travailler dans son propre dossier
+:: Change working directory to the script's own folder
 cd /d "%~dp0"
 
-:: ====================================================================
-:: 1. AUTO-ELEVATION ADMINISTRATEUR (Zero-Click)
-:: ====================================================================
+:: 1. AUTO-ELEVATION — Re-launch with admin rights if not already elevated
 net session >nul 2>&1
 if %errorLevel% neq 0 (
-    echo L'installation necessite les droits d'administrateur.
-    echo Veuillez cliquer sur "Oui" dans la fenetre de securite qui va s'afficher...
+    echo Requesting administrator privileges...
     powershell -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
     exit /b
 )
 
 echo ====================================================================
-echo   DEBUT DE L'INSTALLATION DU ROUTEUR D'IMAGES
+echo   STUDIO VISION IMAGE ROUTER - INSTALLATION
 echo ====================================================================
 echo.
 
-:: ====================================================================
-:: 2. INSTALLATION SILENCIEUSE DU MOTEUR ACCESS
-:: ====================================================================
-echo [1/3] Installation du composant systeme Microsoft Access...
+:: 2. SILENT INSTALL — Microsoft Access Database Engine (x64)
+echo [1/3] Installing Microsoft Access Database Engine...
 if exist "accessdatabaseengine_X64.exe" (
     start /wait "" "accessdatabaseengine_X64.exe" /quiet
-    echo [OK] Composant Access installe avec succes.
+    echo [OK] Access Database Engine installed.
 ) else (
-    echo [ALERTE] Fichier 'accessdatabaseengine_X64.exe' absent - etape ignoree.
+    echo [SKIP] accessdatabaseengine_X64.exe not found - step skipped.
 )
 echo.
 
-:: ====================================================================
-:: 3. CREATION DU DOSSIER ET COPIE DE L'APPLICATION
-:: ====================================================================
-echo [2/3] Configuration du repertoire d'installation...
+:: 3. DEPLOYMENT — Copy application files to target directory
+echo [2/3] Deploying application files...
 set "TARGET_DIR=C:\Routeur_Images"
 if not exist "%TARGET_DIR%" mkdir "%TARGET_DIR%"
 
 if exist "studiovision_monitor_AL.exe" (
     copy /y "studiovision_monitor_AL.exe" "%TARGET_DIR%\studiovision_monitor_AL.exe" >nul
-    echo [OK] Application copiee dans : %TARGET_DIR%
+    echo [OK] Executable copied to: %TARGET_DIR%
 ) else (
-    echo [ERREUR] Le fichier 'studiovision_monitor_AL.exe' est introuvable !
-    echo Assurez-vous d'avoir telecharge les 4 fichiers dans le meme dossier.
+    echo [ERROR] studiovision_monitor_AL.exe not found.
+    echo Make sure all 4 files are in the same folder as this installer.
     pause
     exit /b
 )
 
 if exist "Studiov2000.ico" (
     copy /y "Studiov2000.ico" "%TARGET_DIR%\Studiov2000.ico" >nul
-    echo [OK] Icone copiee dans : %TARGET_DIR%
+    echo [OK] Icon copied to: %TARGET_DIR%
 ) else (
-    echo [ALERTE] Fichier 'Studiov2000.ico' absent - icone ignoree.
+    echo [SKIP] Studiov2000.ico not found - icon step skipped.
 )
 echo.
 
-:: ====================================================================
-:: 4. LANCEMENT POUR CONFIGURATION INITIALE
-:: ====================================================================
-echo [3/3] Lancement de la configuration initiale...
+:: 4. FIRST-RUN SETUP — Launch the application to trigger configuration wizard
+echo [3/3] Launching first-run configuration...
 echo.
 echo ====================================================================
-echo   INSTALLATION DES FICHIERS TERMINEE
+echo   FILES INSTALLED SUCCESSFULLY
 echo ====================================================================
 echo.
-echo Veuillez suivre les dernieres instructions a l'ecran.
+echo Follow the on-screen instructions to complete the setup.
 echo.
 
 start "" "%TARGET_DIR%\studiovision_monitor_AL.exe"

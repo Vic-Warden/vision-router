@@ -1,14 +1,14 @@
 @echo off
-echo   Compiling StudioVision Monitor
+echo Building StudioVision Monitor...
 echo.
 
-echo Checking for PyInstaller...
+:: Ensure PyInstaller is available
 pip install pyinstaller
 
 echo.
-echo Compiling in progress (this may take a minute)...
+echo Compiling — this may take a minute...
 pyinstaller --noconsole --onefile --clean --icon=Studiov2000.ico studiovision_monitor_AL.py
 
 echo.
-echo Done! Your .exe application is in the "dist" folder.
+echo Build complete. Output: dist\studiovision_monitor_AL.exe
 pause
