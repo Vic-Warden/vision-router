@@ -1,28 +1,24 @@
 """
-Box 1 + specialised handling for the Nidek OCT scanner (folder-per-acquisition).
-
-Nidek pipeline:
-  1. File grandparent == SOURCE_DIR  →  identified as Nidek.
-  2. First file of a scan: wait 2 s, delete XML sidecars, keep only the largest
-     image (high-res); discard thumbnails.
-  3. Already-processed scan folders: delete residual files instead of re-inserting.
-  4. Remove empty scan_dir / main_dir after transfer.
-
-Pipeline: PollingObserver → file_queue → Worker → Access DB + UI refresh
-          (1.5 s burst debounce, auto-reconnect on network drop)
-
-Dependencies: watchdog, pyodbc, pywin32, pythoncom, pystray, Pillow, psutil
+1. Nidek Logic: Waits 2s, extracts the highest-res image, deletes XMLs/thumbnails, 
+   and automatically cleans up empty or residual scan directories.
+2. Pipeline: Background watchdog (Observer -> Queue -> Worker) updates the 
+   Access DB and UI (1.5s debounce, auto-reconnect).
+3. Setup: First-run COM detection writes config.ini and creates a shortcut.
 """
 
 import os
-import pythoncom
+import sys
+import time
 import queue
 import shutil
-import sys
-import threading
-import time
 import ctypes
 import logging
+import threading
+import subprocess
+import pythoncom
+import configparser
+import tkinter as tk
+from tkinter import filedialog, messagebox
 from datetime import datetime
 from pathlib import Path
 from watchdog.observers.polling import PollingObserver as Observer
@@ -52,28 +48,452 @@ import win32event
 import winerror
 import psutil
 
-#  Configuration
+ 
+#  Logging — file + stdout, UTF-8
+ 
+_LOG_DIR  = Path(os.path.expanduser("~")) / "studiovision"
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
+_LOG_FILE = _LOG_DIR / "image_router.log"
 
-BOX_NAME    = "Box 2"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  [%(threadName)s]  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.FileHandler(_LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+log = logging.getLogger("image_router")
+
+ 
+#  Installation / wizard helpers
+ 
+
+def get_db_path_from_com() -> "Path | None":
+    """Return the absolute network path to the Studio Vision backend DB.
+    Reads the .Connect property of the linked 'Documents' table via COM.
+    Falls back to CurrentDb().Name (frontend path) if .Connect is unavailable."""
+    if not WIN32_AVAILABLE:
+        log.error("win32com non disponible — détection COM impossible.")
+        return None
+    try:
+        access = win32com.client.GetActiveObject("Access.Application")
+        db     = access.CurrentDb()
+        try:
+            connect_string = db.TableDefs("Documents").Connect
+            if connect_string and "DATABASE=" in connect_string.upper():
+                upper   = connect_string.upper()
+                idx     = upper.index("DATABASE=") + len("DATABASE=")
+                db_path = Path(connect_string[idx:].strip())
+                log.info(f"Backend DB détecté via .Connect : {db_path}")
+                return db_path
+            else:
+                log.warning(
+                    f"Propriété Connect présente mais sans 'DATABASE=' : "
+                    f"'{connect_string}' — fallback sur CurrentDb().Name"
+                )
+        except Exception as e_connect:
+            log.warning(
+                f"Impossible de lire .Connect sur la table 'Documents' "
+                f"({e_connect}) — fallback sur CurrentDb().Name"
+            )
+        db_name = db.Name
+        db_path = Path(db_name)
+        log.info(f"Base de données détectée via COM (fallback Frontend) : {db_path}")
+        return db_path
+    except Exception as e:
+        log.debug(f"COM get_db_path échoué : {e}")
+        return None
+
+
+def lire_raccourci_lnk(lnk_path: str) -> "tuple[str, str, str] | tuple[None, None, None]":
+    """Parse a Windows .lnk shortcut via WScript.Shell.
+    Returns (target, args, cwd) or (None, None, None) on failure."""
+    if not WIN32_AVAILABLE:
+        log.error("win32com non disponible — lecture du raccourci impossible.")
+        return None, None, None
+    try:
+        shell    = win32com.client.Dispatch("WScript.Shell")
+        shortcut = shell.CreateShortcut(lnk_path)
+        target   = shortcut.TargetPath      or ""
+        args     = shortcut.Arguments       or ""
+        cwd      = shortcut.WorkingDirectory or ""
+        log.info(f"Raccourci .lnk lu : {lnk_path}")
+        log.info(f"  TargetPath       : {target}")
+        log.info(f"  Arguments        : {args}")
+        log.info(f"  WorkingDirectory : {cwd}")
+        return target, args, cwd
+    except Exception as e:
+        log.error(f"Lecture du raccourci .lnk échouée ({lnk_path}) : {e}")
+        return None, None, None
+
+
+def auto_detect_sv_shortcut(frontend_path: str) -> "str | None":
+    """Scan user and public desktops for the .lnk that launches this specific frontend.
+    Returns the absolute shortcut path only if exactly one candidate is found."""
+    if not WIN32_AVAILABLE:
+        return None
+    try:
+        shell          = win32com.client.Dispatch("WScript.Shell")
+        user_desktop   = shell.SpecialFolders("Desktop")
+        public_desktop = shell.SpecialFolders("AllUsersDesktop")
+        search_dirs    = [user_desktop]
+        if public_desktop and public_desktop not in search_dirs:
+            search_dirs.append(public_desktop)
+
+        candidates     = []
+        frontend_lower = str(frontend_path).lower()
+        log.info(f"Auto-détection du raccourci pour : {frontend_path}")
+
+        for directory in search_dirs:
+            if not directory or not os.path.exists(directory):
+                continue
+            for filename in os.listdir(directory):
+                if filename.lower().endswith(".lnk"):
+                    lnk_path = os.path.join(directory, filename)
+                    try:
+                        shortcut = shell.CreateShortcut(lnk_path)
+                        target   = str(shortcut.TargetPath or "").lower()
+                        args     = str(shortcut.Arguments  or "").lower()
+                        if frontend_lower in target or frontend_lower in args:
+                            candidates.append(lnk_path)
+                            log.info(f"Candidat trouvé : {lnk_path}")
+                    except Exception as e:
+                        log.debug(f"Erreur lecture .lnk {lnk_path}: {e}")
+
+        if len(candidates) == 1:
+            log.info(f"Succès auto-détection: {candidates[0]}")
+            return candidates[0]
+        elif len(candidates) > 1:
+            log.warning("Multiples candidats trouvés, auto-détection annulée.")
+        else:
+            log.info("Aucun candidat trouvé sur les bureaux.")
+        return None
+    except Exception as e:
+        log.warning(f"Erreur lors de l'auto-détection: {e}")
+        return None
+
+
+def _get_real_user_desktop() -> str:
+    """Return the desktop path of the actual logged-in user, even when running as admin.
+    Priority: USERPROFILE env var > WScript.Shell SpecialFolders('Desktop')."""
+    user_profile = os.environ.get("USERPROFILE", "")
+    if user_profile:
+        candidate = Path(user_profile) / "Desktop"
+        if candidate.exists():
+            log.info(f"Bureau utilisateur réel (USERPROFILE) : {candidate}")
+            return str(candidate)
+    try:
+        shell   = win32com.client.Dispatch("WScript.Shell")
+        desktop = shell.SpecialFolders("Desktop")
+        log.info(f"Bureau via WScript.Shell : {desktop}")
+        return desktop
+    except Exception as e:
+        log.warning(f"Impossible de résoudre le bureau via WScript : {e}")
+        return str(Path.home() / "Desktop")
+
+
+def create_desktop_shortcut(target_exe: Path) -> None:
+    """Create the 'Box 2 - Connected' desktop shortcut pointing to this exe.
+    Always targets the real user's desktop, even when the process is elevated (admin)."""
+    if not WIN32_AVAILABLE:
+        log.warning("win32com non disponible — création du raccourci ignorée.")
+        return
+    try:
+        shell     = win32com.client.Dispatch("WScript.Shell")
+        desktop   = _get_real_user_desktop()
+        lnk_path  = os.path.join(desktop, "Box 2 - Connected.lnk")
+        shortcut  = shell.CreateShortcut(lnk_path)
+        shortcut.TargetPath       = str(target_exe)
+        shortcut.WorkingDirectory = str(target_exe.parent)
+        shortcut.Description      = "Lance Studio Vision avec le routeur d'images Box 2"
+        if ICON_PATH.exists():
+            shortcut.IconLocation = str(ICON_PATH)
+        else:
+            shortcut.IconLocation = f"{target_exe}, 0"
+        shortcut.save()
+        log.info(f"Raccourci Bureau créé : {lnk_path}")
+    except Exception as e:
+        log.error(f"Impossible de créer le raccourci Bureau : {e}")
+
+
+def configurer_via_interface(config_path: Path) -> None:
+    """First-run setup wizard.
+    Detects backend DB via COM, auto-launches Studio Vision as admin if needed,
+    detects Photos folder, prompts for source (rétinographe) folder.
+    Writes config.ini and creates the desktop shortcut, then exits."""
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+
+    # --- Auto-launch Studio Vision as admin if not already running via COM ---
+    def _find_sv_shortcut_on_desktop() -> "str | None":
+        """Scan user desktop for a .lnk that targets MSACCESS.EXE."""
+        if not WIN32_AVAILABLE:
+            return None
+        try:
+            shell   = win32com.client.Dispatch("WScript.Shell")
+            desktop = _get_real_user_desktop()
+            for filename in os.listdir(desktop):
+                if not filename.lower().endswith(".lnk"):
+                    continue
+                lnk = os.path.join(desktop, filename)
+                try:
+                    sc     = shell.CreateShortcut(lnk)
+                    target = str(sc.TargetPath or "").lower()
+                    args   = str(sc.Arguments  or "").lower()
+                    if "msaccess" in target or ".mde" in args or ".mdb" in args or ".accdb" in args:
+                        log.info(f"Raccourci Studio Vision trouvé : {lnk}")
+                        return lnk
+                except Exception:
+                    pass
+        except Exception as e:
+            log.warning(f"Erreur scan bureau pour raccourci SV : {e}")
+        return None
+
+    def _launch_sv_as_admin(lnk_path: str) -> bool:
+        """Launch the given .lnk with runas (admin) via ShellExecute. Returns True on success."""
+        try:
+            ret = ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", lnk_path, None, None, 1  # SW_SHOWNORMAL
+            )
+            return int(ret) > 32
+        except Exception as e:
+            log.error(f"ShellExecute runas échoué : {e}")
+            return False
+
+    def _wait_for_com(timeout: int = 60) -> bool:
+        """Wait up to timeout seconds for Access COM to become available."""
+        log.info(f"Attente du démarrage de Studio Vision (max {timeout}s)...")
+        for elapsed in range(timeout):
+            time.sleep(1)
+            try:
+                win32com.client.GetActiveObject("Access.Application")
+                log.info(f"COM Access disponible après ~{elapsed + 1}s.")
+                return True
+            except Exception:
+                pass
+        log.warning("COM Access non disponible après le délai imparti.")
+        return False
+
+    # Detect backend DB via COM (requires Access to be open)
+    backend_mdb = get_db_path_from_com()
+    if backend_mdb is None:
+        sv_lnk = _find_sv_shortcut_on_desktop()
+        if sv_lnk:
+            messagebox.showinfo(
+                "Lancement de Studio Vision",
+                "Studio Vision n'est pas ouvert.\n\n"
+                "Il va être lancé automatiquement en mode administrateur.\n"
+                "Veuillez accepter la demande d'élévation (UAC) si elle apparaît."
+            )
+            launched = _launch_sv_as_admin(sv_lnk)
+            if launched:
+                com_ready = _wait_for_com(timeout=60)
+                if com_ready:
+                    backend_mdb = get_db_path_from_com()
+                    if backend_mdb is None:
+                        messagebox.showerror(
+                            "Base de données introuvable",
+                            "Studio Vision a démarré mais la base de données n'a pas pu être détectée.\n"
+                            "Vérifiez que Studio Vision est bien connecté au réseau, puis relancez l'installation."
+                        )
+                        sys.exit(1)
+                else:
+                    messagebox.showerror(
+                        "Délai dépassé",
+                        "Studio Vision n'a pas répondu dans les 60 secondes.\n"
+                        "Vérifiez que Studio Vision se lance correctement, puis relancez l'installation."
+                    )
+                    sys.exit(1)
+            else:
+                messagebox.showerror(
+                    "Lancement échoué",
+                    "Impossible de lancer Studio Vision automatiquement.\n\n"
+                    "Veuillez l'ouvrir manuellement en tant qu'administrateur\n"
+                    "(clic droit sur le raccourci → Exécuter en tant qu'administrateur),\n"
+                    "puis relancez INSTALLATION_AUTOMATIQUE.bat."
+                )
+                sys.exit(1)
+        else:
+            messagebox.showerror(
+                "Raccourci Studio Vision introuvable",
+                "Studio Vision n'est pas ouvert et son raccourci n'a pas été trouvé sur le Bureau.\n\n"
+                "Veuillez l'ouvrir manuellement en tant qu'administrateur\n"
+                "(clic droit sur le raccourci → Exécuter en tant qu'administrateur),\n"
+                "puis relancez INSTALLATION_AUTOMATIQUE.bat."
+            )
+            sys.exit(1)
+
+    # Try to auto-detect the Studio Vision .lnk shortcut for SV_TARGET/SV_ARGS/SV_CWD
+    frontend_path = None
+    try:
+        access        = win32com.client.GetActiveObject("Access.Application")
+        frontend_path = access.CurrentDb().Name
+    except Exception:
+        log.warning("Impossible de lire CurrentDb().Name pour l'auto-détection.")
+
+    sv_target, sv_args, sv_cwd = None, None, None
+    lnk_path = None
+    if frontend_path:
+        lnk_path = auto_detect_sv_shortcut(frontend_path)
+    if lnk_path:
+        sv_target, sv_args, sv_cwd = lire_raccourci_lnk(lnk_path)
+    if not sv_target:
+        messagebox.showinfo(
+            "Raccourci introuvable",
+            "La détection automatique du raccourci a échoué.\n\n"
+            "Veuillez sélectionner votre raccourci 'Studio Vision' habituel."
+        )
+        lnk_path_manual = filedialog.askopenfilename(
+            title="Sélectionnez le raccourci Studio Vision",
+            filetypes=[("Raccourci Windows", "*.lnk")],
+        )
+        if not lnk_path_manual:
+            messagebox.showerror(
+                "Installation annulée",
+                "Aucun raccourci sélectionné.\nRelancez l'installation pour recommencer."
+            )
+            sys.exit(1)
+        sv_target, sv_args, sv_cwd = lire_raccourci_lnk(lnk_path_manual)
+        if not sv_target:
+            messagebox.showerror(
+                "Raccourci illisible",
+                "Impossible de lire le raccourci.\nRelancez l'installation."
+            )
+            sys.exit(1)
+
+    log.info(f"SV_TARGET : {sv_target}")
+    log.info(f"SV_ARGS   : {sv_args}")
+    log.info(f"SV_CWD    : {sv_cwd or '(vide)'}")
+
+    # Locate Photos folder: check one and two levels above backend DB
+    _candidate1 = backend_mdb.parent / "Photos"
+    _candidate2 = backend_mdb.parent.parent / "Photos"
+    if _candidate1.is_dir():
+        dest_photos = _candidate1
+        log.info(f"DEST_PHOTOS détecté (niveau 1) : {dest_photos}")
+    elif _candidate2.is_dir():
+        dest_photos = _candidate2
+        log.info(f"DEST_PHOTOS détecté (niveau 2) : {dest_photos}")
+    else:
+        log.warning("Dossier Photos introuvable. Demande manuelle à l'utilisateur.")
+        messagebox.showinfo(
+            "Dossier Photos introuvable",
+            "Le dossier 'Photos' de Studio Vision n'a pas pu être détecté automatiquement.\n\n"
+            "Cliquez sur OK, puis sélectionnez ce dossier manuellement."
+        )
+        _photos_manual = filedialog.askdirectory(
+            title="Sélectionnez le dossier Photos de Studio Vision"
+        )
+        if not _photos_manual:
+            messagebox.showerror(
+                "Installation annulée",
+                "Aucun dossier Photos sélectionné.\nRelancez l'installation."
+            )
+            sys.exit(1)
+        dest_photos = Path(_photos_manual)
+        log.info(f"DEST_PHOTOS sélectionné manuellement : {dest_photos}")
+
+    # Mandatory: pick the rétinographe / source folder
+    source_dir = filedialog.askdirectory(
+        title="Dernière étape : Sélectionnez le dossier source du rétinographe (Box 2)"
+    )
+    if not source_dir:
+        messagebox.showerror(
+            "Installation annulée",
+            "Aucun dossier sélectionné.\nRelancez l'installation pour recommencer."
+        )
+        sys.exit(1)
+
+    orphan_dir = str(Path(_get_real_user_desktop()) / "Orphelins")
+
+    cfg = configparser.ConfigParser()
+    cfg["GENERAL"] = {"BOX_NAME": "Box 2"}
+    cfg["PATHS"] = {
+        "SOURCE_DIR":  source_dir,
+        "ORPHAN_DIR":  orphan_dir,
+        "DEST_PHOTOS": str(dest_photos),
+        "BACKEND_MDB": str(backend_mdb),
+        "SV_TARGET":   sv_target,
+        "SV_ARGS":     sv_args  or "",
+        "SV_CWD":      sv_cwd   or "",
+    }
+    cfg["TIMEOUTS"] = {"PATIENT_WAIT_TIMEOUT": "900"}
+    with open(config_path, "w", encoding="utf-8") as f:
+        cfg.write(f)
+    log.info(f"config.ini écrit dans : {config_path}")
+
+    own_exe = Path(sys.executable) if getattr(sys, "frozen", False) else Path(__file__).resolve()
+    create_desktop_shortcut(own_exe)
+
+    messagebox.showinfo(
+        "Installation terminée !",
+        "Installation terminée avec succès !\n\n"
+        "Studio Vision va être fermé automatiquement.\n"
+        "Pour travailler, utilisez désormais uniquement\n"
+        "le raccourci  'Box 2 - Connected'\n"
+        "créé sur votre Bureau."
+    )
+    # Close Studio Vision automatically — no manual step needed
+    try:
+        subprocess.run(["taskkill", "/F", "/IM", "MSACCESS.EXE"], capture_output=True, timeout=10)
+        log.info("Studio Vision (MSACCESS.EXE) fermé automatiquement en fin d'installation.")
+    except Exception as e:
+        log.warning(f"Impossible de fermer MSACCESS.EXE automatiquement : {e}")
+    root.destroy()
+    os._exit(0)
+
+
+ 
+#  Resolve base directory and config path
+ 
+if getattr(sys, "frozen", False):
+    _base_dir = Path(sys.executable).parent
+else:
+    _base_dir = Path(__file__).resolve().parent
+_config_path = _base_dir / "config.ini"
+ICON_PATH    = _base_dir / "Studiov2000.ico"
+
+# First run: launch setup wizard before loading any config
+if not _config_path.exists():
+    configurer_via_interface(_config_path)
+
+config = configparser.ConfigParser()
+config.read(_config_path, encoding="utf-8")
+
+BOX_NAME             = config.get("GENERAL", "BOX_NAME",    fallback="Box 2")
+SOURCE_DIR           = Path(config.get("PATHS", "SOURCE_DIR"))
+ORPHAN_DIR           = Path(config.get("PATHS", "ORPHAN_DIR"))
+DEST_PHOTOS          = Path(config.get("PATHS", "DEST_PHOTOS"))
+PUBLIC_MDB           = Path(
+    config.get("PATHS", "BACKEND_MDB",
+               fallback=config.get("PATHS", "PUBLIC_MDB", fallback=""))
+)
+SV_TARGET            = config.get("PATHS", "SV_TARGET", fallback="").strip()
+SV_ARGS              = config.get("PATHS", "SV_ARGS",   fallback="").strip()
+SV_CWD               = config.get("PATHS", "SV_CWD",    fallback="").strip()
+PATIENT_WAIT_TIMEOUT = config.getint("TIMEOUTS", "PATIENT_WAIT_TIMEOUT", fallback=900)
 
 STUDIO_VISION_EXE = "studiovision.exe"
+_MSACCESS_EXE     = "MSACCESS.EXE"
 
-SOURCE_DIR  = Path(r"??")
-ORPHAN_DIR  = Path(r"??")
-DEST_PHOTOS = Path(r"??")
-PUBLIC_MDB  = Path(r"??")
-
-WATCHED_EXTENSIONS = {".jpg", ".jpeg", ".jfif", ".png", ".bmp", ".tif", ".tiff", ".dcm", ".pdf", ".rtf", ".doc", ".docx", ".odt", ".xps", ".html"}
+WATCHED_EXTENSIONS = {
+    ".jpg", ".jpeg", ".jfif", ".png", ".bmp",
+    ".tif", ".tiff",
+    ".dcm",
+    ".pdf", ".rtf", ".doc", ".docx", ".odt", ".xps", ".html",
+}
 FILE_LOCK_RETRY_DELAY  = 3
 FILE_LOCK_MAX_ATTEMPTS = 15
 PATIENT_POLL_INTERVAL  = 3
-PATIENT_WAIT_TIMEOUT   = 900
+_NETWORK_SHARE_POLL    = 10
 
 ACCESS_FIELD_CODE   = "Code patient"
 ACCESS_FIELD_NOM    = "NOM"
 ACCESS_FIELD_PRENOM = "Prénom"
-
-SFDOC_SUBFORM_NAME = "SFDoc"
+SFDOC_SUBFORM_NAME  = "SFDoc"
 
 EXAM_DESCRIPTION = {
     ".jpg":  "Image",
@@ -93,44 +513,27 @@ EXAM_DESCRIPTION = {
     ".html": "Document",
 }
 
-_LOG_DIR  = Path(os.path.expanduser("~")) / "studiovision"
-_LOG_DIR.mkdir(parents=True, exist_ok=True)
-_LOG_FILE = _LOG_DIR / "image_router.log"
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  [%(threadName)s]  %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.FileHandler(_LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-log = logging.getLogger("image_router")
-
-_NETWORK_SHARE_POLL = 10
-
-# System tray
-_ICON_SIZE     = 64
-_COLOR_READY   = (30, 144, 255)   # dodger blue
-_COLOR_ACTIVE  = (50, 205, 50)    # lime green
+ 
+#  System tray globals
+ 
+_ICON_SIZE    = 64
+_COLOR_READY  = (30, 144, 255)
+_COLOR_ACTIVE = (50, 205, 50)
 
 _icon: "pystray.Icon | None" = None
 _status_text: str             = "Starting..."
 _stop_event: threading.Event  = threading.Event()
-
 _mutex_handle = None
 
 
+ 
+#  Tray helpers
+ 
 def _make_icon(color: tuple) -> "Image.Image":
-    """Generate a solid-circle tray icon with Pillow (no external .ico needed)."""
     img  = Image.new("RGBA", (_ICON_SIZE, _ICON_SIZE), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     margin = 4
-    draw.ellipse(
-        [margin, margin, _ICON_SIZE - margin, _ICON_SIZE - margin],
-        fill=color,
-    )
+    draw.ellipse([margin, margin, _ICON_SIZE - margin, _ICON_SIZE - margin], fill=color)
     return img
 
 
@@ -165,6 +568,10 @@ def _quit(icon, item) -> None:  # noqa: ARG001
     _stop_event.set()
     icon.stop()
 
+
+ 
+#  Network / sleep helpers
+ 
 def wait_for_network_share() -> None:
     is_network = str(SOURCE_DIR).startswith("\\\\") or str(SOURCE_DIR).startswith("//")
     if not is_network:
@@ -181,13 +588,27 @@ def wait_for_network_share() -> None:
         log.info(f"Network share is now accessible after {attempt} attempt(s): {SOURCE_DIR}")
 
 
+def prevent_sleep() -> None:
+    try:
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            0x80000000 |  # ES_CONTINUOUS
+            0x00000001    # ES_SYSTEM_REQUIRED
+        )
+        log.info("Sleep prevention active.")
+    except Exception as e:
+        log.warning(f"Could not set execution state: {e}")
+
+
+ 
+#  Database helpers
+ 
 def db_connect(mdb_path: Path):
     return pyodbc.connect(
         f"DRIVER={{Microsoft Access Driver (*.mdb, *.accdb)}};DBQ={mdb_path};"
     )
 
 
-def get_active_patient() -> dict | None:
+def get_active_patient() -> "dict | None":
     if not WIN32_AVAILABLE:
         return None
     try:
@@ -195,10 +616,8 @@ def get_active_patient() -> dict | None:
         form   = access.Screen.ActiveForm
         if form is None:
             return None
-
         target = {ACCESS_FIELD_CODE, ACCESS_FIELD_NOM, ACCESS_FIELD_PRENOM}
         data: dict = {}
-
         for i in range(form.Controls.Count):
             ctrl = form.Controls(i)
             try:
@@ -206,22 +625,19 @@ def get_active_patient() -> dict | None:
                     data[ctrl.Name] = ctrl.Value
             except Exception:
                 pass
-
         if not target.issubset(data.keys()):
             return None
-
         return {
             "code":   str(data[ACCESS_FIELD_CODE]),
             "nom":    str(data[ACCESS_FIELD_NOM]),
             "prenom": str(data[ACCESS_FIELD_PRENOM]),
         }
-
     except Exception as e:
         log.debug(f"COM error: {e}")
         return None
 
 
-def find_patient_folder(patient_code: str) -> Path | None:
+def find_patient_folder(patient_code: str) -> "Path | None":
     if not PYODBC_AVAILABLE:
         log.error("pyodbc not available.")
         return None
@@ -238,21 +654,17 @@ def find_patient_folder(patient_code: str) -> Path | None:
         )
         row = cursor.fetchone()
         conn.close()
-
         if not row or not row[0]:
             log.warning(f"No existing document found for patient {patient_code}.")
             return None
-
         parts = row[0].strip().strip("\\").split("\\")
         if len(parts) < 2:
             log.error(f"Unexpected Photo externe format: {row[0]}")
             return None
-
         folder = DEST_PHOTOS / parts[0] / parts[1]
         if not folder.is_dir():
             log.error(f"Folder found in DB but missing on disk: {folder}")
             return None
-
         log.info(f"Patient folder resolved: {folder}")
         return folder
     except Exception as e:
@@ -264,14 +676,11 @@ def insert_document(patient: dict, relative_path: str, description: str) -> bool
     if not PYODBC_AVAILABLE:
         log.warning("pyodbc not available, insert skipped.")
         return False
-
-    target_mdb = PUBLIC_MDB
-    if not target_mdb.exists():
+    if not PUBLIC_MDB.exists():
         log.error("PUBLIC.MDB not found, insert skipped.")
         return False
-
     try:
-        conn   = db_connect(target_mdb)
+        conn   = db_connect(PUBLIC_MDB)
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -283,13 +692,16 @@ def insert_document(patient: dict, relative_path: str, description: str) -> bool
         )
         conn.commit()
         conn.close()
-        log.info(f"Insert OK: patient={patient['code']} path='{relative_path}' db={target_mdb.name}")
+        log.info(f"Insert OK: patient={patient['code']} path='{relative_path}' db={PUBLIC_MDB.name}")
         return True
     except Exception as e:
         log.error(f"DB insert failed: {e}")
         return False
 
 
+ 
+#  UI refresh
+ 
 _AC_SUBFORM = 112
 
 
@@ -309,7 +721,7 @@ def _find_sfdoc(form):
     return None
 
 
-def refresh_ui(expected_patient_code: str | None = None) -> None:
+def refresh_ui(expected_patient_code: "str | None" = None) -> None:
     if not WIN32_AVAILABLE:
         return
     try:
@@ -318,9 +730,8 @@ def refresh_ui(expected_patient_code: str | None = None) -> None:
         if form is None:
             log.warning("Refresh skipped: no active form in Access.")
             return
-
         if expected_patient_code is not None:
-            current = get_active_patient()
+            current      = get_active_patient()
             current_code = current["code"] if current else None
             if current_code != expected_patient_code:
                 log.warning(
@@ -328,7 +739,6 @@ def refresh_ui(expected_patient_code: str | None = None) -> None:
                     f"(expected={expected_patient_code}, current={current_code})."
                 )
                 return
-
         try:
             form.Refresh()
             log.info(f"Refresh() on parent form '{form.Name}'")
@@ -342,7 +752,6 @@ def refresh_ui(expected_patient_code: str | None = None) -> None:
                 "SFDoc refresh skipped."
             )
             return
-
         try:
             if form.Dirty:
                 log.info("Parent form is in edit mode (Dirty=True); clearing Dirty before Requery.")
@@ -352,7 +761,6 @@ def refresh_ui(expected_patient_code: str | None = None) -> None:
 
         _REQUERY_ATTEMPTS = 3
         _REQUERY_DELAY    = 0.5
-
         requery_ok = False
         for attempt in range(1, _REQUERY_ATTEMPTS + 1):
             try:
@@ -377,9 +785,7 @@ def refresh_ui(expected_patient_code: str | None = None) -> None:
                 sfdoc.Refresh()
                 log.info(f"Fallback Refresh() on '{SFDOC_SUBFORM_NAME}'")
             except Exception as e_ref2:
-                log.warning(
-                    f"Fallback Refresh() also failed on '{SFDOC_SUBFORM_NAME}': {e_ref2}"
-                )
+                log.warning(f"Fallback Refresh() also failed on '{SFDOC_SUBFORM_NAME}': {e_ref2}")
 
         try:
             sfdoc.Recordset.MoveLast()
@@ -391,6 +797,9 @@ def refresh_ui(expected_patient_code: str | None = None) -> None:
         log.warning(f"COM refresh failed (non-blocking): {e}")
 
 
+ 
+#  File helpers
+ 
 def wait_for_file(file: Path) -> bool:
     for attempt in range(1, FILE_LOCK_MAX_ATTEMPTS + 1):
         try:
@@ -403,15 +812,13 @@ def wait_for_file(file: Path) -> bool:
     return False
 
 
-def move_file(source: Path, dest_folder: Path, label: str = "") -> Path | None:
+def move_file(source: Path, dest_folder: Path, label: str = "") -> "Path | None":
     dest_folder.mkdir(parents=True, exist_ok=True)
     dest = dest_folder / source.name
-
     if dest.exists():
         ts   = int(time.time())
         dest = dest_folder / f"{source.stem}_{ts}{source.suffix}"
         log.info(f"Name conflict, renamed to {dest.name}")
-
     try:
         shutil.move(str(source), str(dest))
         tag = f"[{label}]  " if label else ""
@@ -438,17 +845,6 @@ def _try_rmdir(folder: Path) -> None:
         log.debug(f"_try_rmdir({folder}) ignored: {e}")
 
 
-def prevent_sleep() -> None:
-    try:
-        ctypes.windll.kernel32.SetThreadExecutionState(
-            0x80000000 |  # ES_CONTINUOUS
-            0x00000001    # ES_SYSTEM_REQUIRED
-        )
-        log.info("Sleep prevention active.")
-    except Exception as e:
-        log.warning(f"Could not set execution state: {e}")
-
-
 def clear_source_dir() -> None:
     items = list(SOURCE_DIR.iterdir())
     if not items:
@@ -468,16 +864,17 @@ def clear_source_dir() -> None:
     log.info("Source directory cleared.")
 
 
+ 
 #  Worker thread
+ 
 def worker(file_queue: queue.Queue) -> None:
     pythoncom.CoInitialize()
     log.info("Worker started.")
 
-    processed_scan_dirs: set[Path] = set()
-
+    processed_scan_dirs: set = set()
     needs_refresh: bool      = False
-    last_patient_code: str | None = None
-    burst_count: int         = 0   # files successfully inserted in the current burst
+    last_patient_code: "str | None" = None
+    burst_count: int         = 0
 
     try:
         while True:
@@ -487,12 +884,9 @@ def worker(file_queue: queue.Queue) -> None:
                 if needs_refresh:
                     log.info("Burst complete — triggering batched UI refresh.")
                     refresh_ui(expected_patient_code=last_patient_code)
-                    needs_refresh = False
+                    needs_refresh     = False
                     last_patient_code = None
-                    _notify(
-                        "Transfer complete",
-                        f"{burst_count} file(s) processed",
-                    )
+                    _notify("Transfer complete", f"{burst_count} file(s) processed")
                     _set_status(f"{BOX_NAME} — Ready", processing=False)
                     burst_count = 0
                 continue
@@ -502,7 +896,6 @@ def worker(file_queue: queue.Queue) -> None:
 
             log.info(f"Processing: {file.name} ({file_queue.qsize()} pending)")
 
-            # First file of a new burst
             if burst_count == 0 and not needs_refresh:
                 _notify("Transfer in progress", file.name)
             _set_status("Transfer in progress...", processing=True)
@@ -518,7 +911,11 @@ def worker(file_queue: queue.Queue) -> None:
                 file_queue.task_done()
                 continue
 
-            # Nidek deduplication
+            # ------------------------------------------------------------------
+            #  Nidek deduplication — DO NOT MODIFY
+            #  Specific to rétinographes: keep only the largest image,
+            #  discard XML sidecars and thumbnails, clean up empty folders.
+            # ------------------------------------------------------------------
             scan_dir = file.parent
             main_dir = file.parent.parent
             is_nidek = main_dir.parent == SOURCE_DIR
@@ -530,12 +927,10 @@ def worker(file_queue: queue.Queue) -> None:
                         log.info(f"[NIDEK] Residual removed (scan already processed): {file.name}")
                     except Exception as e:
                         log.warning(f"[NIDEK] Could not remove residual {file.name}: {e}")
-
                     _try_rmdir(scan_dir)
                     _try_rmdir(main_dir)
                     if not scan_dir.exists():
                         processed_scan_dirs.discard(scan_dir)
-
                     file_queue.task_done()
                     continue
 
@@ -575,7 +970,9 @@ def worker(file_queue: queue.Queue) -> None:
                     f"({file.stat().st_size:,} bytes)"
                 )
                 processed_scan_dirs.add(scan_dir)
-            # End Nidek deduplication
+            # ------------------------------------------------------------------
+            #  End Nidek deduplication
+            # ------------------------------------------------------------------
 
             patient    = None
             start_time = time.monotonic()
@@ -585,7 +982,6 @@ def worker(file_queue: queue.Queue) -> None:
                 patient = get_active_patient()
                 if patient:
                     break
-
                 elapsed = time.monotonic() - start_time
                 if elapsed >= PATIENT_WAIT_TIMEOUT:
                     orphan_file(file)
@@ -593,14 +989,12 @@ def worker(file_queue: queue.Queue) -> None:
                     file_queue.task_done()
                     patient = None
                     break
-
                 if first_log:
                     log.info(
                         f"No patient open, waiting "
                         f"(timeout in {PATIENT_WAIT_TIMEOUT // 60} min)"
                     )
                     first_log = False
-
                 time.sleep(PATIENT_POLL_INTERVAL)
 
             if patient is None:
@@ -654,7 +1048,9 @@ def worker(file_queue: queue.Queue) -> None:
         pythoncom.CoUninitialize()
 
 
+ 
 #  Watchdog producer
+ 
 class ImageProducer(FileSystemEventHandler):
     def __init__(self, file_queue: queue.Queue) -> None:
         super().__init__()
@@ -670,13 +1066,10 @@ class ImageProducer(FileSystemEventHandler):
         self._queue.put(file)
 
 
+ 
 #  Background thread (observer + auto-reconnect loop)
+ 
 def _run_background(file_queue: queue.Queue) -> None:
-    """
-    Wraps the PollingObserver lifecycle and auto-reconnect loop.
-    Runs in a daemon thread so pystray can own the main thread.
-    Includes the Box 2 startup clear_source_dir() call.
-    """
     _RECONNECT_WAIT = 15
 
     # Box 2: clear leftover files before the observer starts watching.
@@ -711,27 +1104,27 @@ def _run_background(file_queue: queue.Queue) -> None:
     finally:
         observer.stop()
         observer.join()
-
         remaining = file_queue.qsize()
         if remaining:
             log.info(f"Waiting for {remaining} remaining file(s)...")
             file_queue.join()
-
         log.info("Background thread stopped.")
         if _icon is not None:
             _icon.stop()
 
+
+ 
+#  Entry point
+ 
 def main() -> None:
     global _icon, _mutex_handle
 
-    # Single-instance guard: only one instance may run at a time.
-    # If a previous instance is already active, exit silently.
+    # Single-instance guard
     _mutex_handle = win32event.CreateMutex(None, False, "ImageRouter_Box2_Mutex")
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
         sys.exit(0)
 
-    # Manual-relaunch guard: if the parent is explorer.exe (double-click)
-    # and Studio Vision is already running, block the launch and notify.
+    # Manual-relaunch guard: if launched by double-click while Studio Vision is running, warn.
     try:
         parent_name = psutil.Process(os.getpid()).parent().name().lower()
     except Exception:
@@ -747,7 +1140,7 @@ def main() -> None:
                 0,
                 "To restart the image router, please fully close and relaunch Studio Vision.",
                 "Image Router",
-                0x30,  # MB_ICONWARNING | MB_OK
+                0x30,
             )
             sys.exit(0)
 
@@ -760,10 +1153,11 @@ def main() -> None:
 
     ORPHAN_DIR.mkdir(parents=True, exist_ok=True)
 
-    log.info("Version 4 started")
+    log.info("Version 5 — Box 2 + wizard + config.ini")
     log.info(f"  Source     : {SOURCE_DIR}")
     log.info(f"  Dest       : {DEST_PHOTOS}")
     log.info(f"  PUBLIC.MDB : {PUBLIC_MDB}")
+    log.info(f"  SV_TARGET  : {SV_TARGET or '(non configuré)'}")
     log.info(f"  Orphans    : {ORPHAN_DIR}")
     log.info(f"  Log file   : {_LOG_FILE}")
     log.info(f"  Timeout    : {PATIENT_WAIT_TIMEOUT // 60} min")
@@ -771,13 +1165,8 @@ def main() -> None:
 
     file_queue: queue.Queue = queue.Queue()
 
-    threading.Thread(
-        target=worker, args=(file_queue,), name="Worker", daemon=True
-    ).start()
-
-    threading.Thread(
-        target=_run_background, args=(file_queue,), name="Background", daemon=True
-    ).start()
+    threading.Thread(target=worker,         args=(file_queue,), name="Worker",     daemon=True).start()
+    threading.Thread(target=_run_background, args=(file_queue,), name="Background", daemon=True).start()
 
     if not TRAY_AVAILABLE:
         log.warning("pystray/Pillow not available — running without system tray.")
@@ -791,11 +1180,7 @@ def main() -> None:
         return
 
     menu = pystray.Menu(
-        pystray.MenuItem(
-            text=lambda item: _status_text,
-            action=None,
-            enabled=False,
-        ),
+        pystray.MenuItem(text=lambda item: _status_text, action=None, enabled=False),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Open logs", _open_logs),
         pystray.MenuItem("Quit", _quit),
@@ -810,9 +1195,9 @@ def main() -> None:
 
     log.info("System tray icon started.")
     _icon.run()
-
     _stop_event.set()
     log.info("Application stopped.")
+
 
 if __name__ == "__main__":
     main()
