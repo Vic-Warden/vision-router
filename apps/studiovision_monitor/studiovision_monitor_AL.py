@@ -167,14 +167,33 @@ def auto_detect_sv_shortcut(frontend_path: str) -> "str | None":
         return None
 
 
+def _get_real_user_desktop() -> str:
+    """Return the desktop path of the actual logged-in user, even when running as admin.
+    Priority: USERPROFILE env var > WScript.Shell SpecialFolders("Desktop")."""
+    user_profile = os.environ.get("USERPROFILE", "")
+    if user_profile:
+        candidate = Path(user_profile) / "Desktop"
+        if candidate.exists():
+            log.info(f"Bureau utilisateur réel (USERPROFILE) : {candidate}")
+            return str(candidate)
+    try:
+        shell = win32com.client.Dispatch("WScript.Shell")
+        desktop = shell.SpecialFolders("Desktop")
+        log.info(f"Bureau via WScript.Shell : {desktop}")
+        return desktop
+    except Exception as e:
+        log.warning(f"Impossible de résoudre le bureau via WScript : {e}")
+        return str(Path.home() / "Desktop")
+
 def create_desktop_shortcut(target_exe: Path) -> None:
-    """Create the 'Studio Vision - Connected' desktop shortcut pointing to this exe."""
+    """Create the 'Studio Vision - Connected' desktop shortcut pointing to this exe.
+    Always targets the real user's desktop, even when the process is elevated (admin)."""
     if not WIN32_AVAILABLE:
         log.warning("win32com non disponible — création du raccourci ignorée.")
         return
     try:
         shell      = win32com.client.Dispatch("WScript.Shell")
-        desktop    = shell.SpecialFolders("Desktop")
+        desktop    = _get_real_user_desktop()
         lnk_path   = os.path.join(desktop, "Studio Vision - Connected.lnk")
         shortcut   = shell.CreateShortcut(lnk_path)
         shortcut.TargetPath       = str(target_exe)
@@ -852,22 +871,80 @@ def _is_sv_running() -> bool:
         log.warning(f"Impossible de vérifier si MSACCESS.EXE tourne : {e}")
         return False
 
-def _ensure_sv_running() -> None:
-    """Launch Studio Vision if MSACCESS.EXE is not running.
+def _is_sv_frontend_loaded() -> bool:
+    """Return True if the correct Studio Vision frontend (.mde) is loaded in Access.
+    Checks via COM that CurrentDb().Name matches SV_ARGS (the .mde path).
+    Falls back to True if COM is unavailable (to avoid killing a valid session)."""
+    if not WIN32_AVAILABLE:
+        return _is_sv_running()
+    if not SV_ARGS:
+        return _is_sv_running()
+    # Extract the .mde path from SV_ARGS (format: /runtime path\file.mde /wrkgrp ...)
+    mde_path = None
+    for part in SV_ARGS.split():
+        if part.lower().endswith(".mde") or part.lower().endswith(".mdb") or part.lower().endswith(".accdb"):
+            mde_path = part.strip('"').lower()
+            break
+    if mde_path is None:
+        return _is_sv_running()
+    try:
+        access = win32com.client.GetActiveObject("Access.Application")
+        current_db = access.CurrentDb().Name.lower()
+        if mde_path in current_db or current_db in mde_path:
+            log.info(f"Studio Vision correctement chargé : {current_db}")
+            return True
+        else:
+            log.warning(
+                f"MSACCESS.EXE tourne mais avec une base différente : "
+                f"'{current_db}' (attendu: '{mde_path}') — relancement nécessaire."
+            )
+            return False
+    except Exception:
+        # COM not responding = Access is open but the frontend is not loaded yet, or crashed
+        log.warning("MSACCESS.EXE présent mais COM non disponible — considéré comme non prêt.")
+        return False
+
+def _kill_msaccess() -> None:
+    """Force-terminate all MSACCESS.EXE processes."""
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/IM", _MSACCESS_EXE],
+            capture_output=True, timeout=10
+        )
+        log.info("MSACCESS.EXE terminé de force.")
+        time.sleep(2)
+    except Exception as e:
+        log.warning(f"Impossible de terminer MSACCESS.EXE : {e}")
+
+def _ensure_sv_running(force_relaunch: bool = False) -> None:
+    """Launch Studio Vision if not running, or if the wrong frontend is loaded.
+    When force_relaunch=True (duplicate instance), kill any zombie MSACCESS and restart.
     Replicates a double-click on the original shortcut using SV_TARGET/SV_ARGS/SV_CWD."""
-    if _is_sv_running():
-        log.info("MSACCESS.EXE est déjà en cours d'exécution.")
-        return
     if not SV_TARGET:
         log.warning(
             "SV_TARGET non configuré — "
             "lancement automatique de Studio Vision désactivé."
         )
         return
+
+    sv_ok = _is_sv_frontend_loaded()
+
+    if sv_ok and not force_relaunch:
+        log.info("Studio Vision est déjà en cours d'exécution avec le bon frontend.")
+        return
+
+    if not sv_ok and _is_sv_running():
+        log.warning("MSACCESS.EXE zombie ou mauvais frontend détecté — fermeture forcée.")
+        _kill_msaccess()
+    elif force_relaunch and sv_ok:
+        # Duplicate click but SV is fine — nothing to do
+        log.info("Studio Vision déjà actif et fonctionnel — aucune action nécessaire.")
+        return
+
     cmd = f'"{SV_TARGET}"'
     if SV_ARGS:
         cmd = f'{cmd} {SV_ARGS}'
-    log.info(f"MSACCESS.EXE non détecté — relancement via : {cmd}")
+    log.info(f"Lancement de Studio Vision via : {cmd}")
     log.info(f"  WorkingDirectory  : {SV_CWD or '(hérité)'}")
     try:
         subprocess.Popen(
@@ -881,11 +958,11 @@ def _ensure_sv_running() -> None:
     _SV_LAUNCH_TIMEOUT = 30
     for elapsed in range(_SV_LAUNCH_TIMEOUT):
         time.sleep(1)
-        if _is_sv_running():
-            log.info(f"MSACCESS.EXE démarré avec succès (après ~{elapsed + 1}s).")
+        if _is_sv_frontend_loaded():
+            log.info(f"Studio Vision démarré avec succès (après ~{elapsed + 1}s).")
             return
     log.warning(
-        f"MSACCESS.EXE n'a pas démarré dans les {_SV_LAUNCH_TIMEOUT}s imparties. "
+        f"Studio Vision n'a pas répondu dans les {_SV_LAUNCH_TIMEOUT}s imparties. "
         "Le routeur va continuer et attendra la connexion COM."
     )
 
@@ -894,11 +971,11 @@ def main() -> None:
     # Single-instance guard: if already running, just ensure SV is up and exit
     _mutex_handle = win32event.CreateMutex(None, False, "ImageRouter_StudioVision_Mutex")
     if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
-        log.info("Instance déjà en cours — vérification de Studio Vision avant arrêt.")
-        _ensure_sv_running()
+        log.info("Instance déjà en cours — vérification et relancement de Studio Vision si nécessaire.")
+        _ensure_sv_running(force_relaunch=True)
         log.info("Arrêt silencieux du processus doublon.")
         sys.exit(0)
-    _ensure_sv_running()
+    _ensure_sv_running(force_relaunch=False)
     prevent_sleep()
     if not SOURCE_DIR.exists():
         log.critical(f"Source folder not found: {SOURCE_DIR}")
