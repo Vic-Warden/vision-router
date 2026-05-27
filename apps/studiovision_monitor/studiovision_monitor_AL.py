@@ -216,17 +216,107 @@ def configurer_via_interface(config_path: Path) -> None:
     root.withdraw()
     root.attributes("-topmost", True)
 
+    # --- Auto-launch Studio Vision as admin if not already running via COM ---
+    def _find_sv_shortcut_on_desktop() -> "str | None":
+        """Scan user desktop for a .lnk that targets MSACCESS.EXE."""
+        if not WIN32_AVAILABLE:
+            return None
+        try:
+            shell = win32com.client.Dispatch("WScript.Shell")
+            desktop = _get_real_user_desktop()
+            for filename in os.listdir(desktop):
+                if not filename.lower().endswith(".lnk"):
+                    continue
+                lnk = os.path.join(desktop, filename)
+                try:
+                    sc = shell.CreateShortcut(lnk)
+                    target = str(sc.TargetPath or "").lower()
+                    args   = str(sc.Arguments  or "").lower()
+                    if "msaccess" in target or ".mde" in args or ".mdb" in args or ".accdb" in args:
+                        log.info(f"Raccourci Studio Vision trouvé : {lnk}")
+                        return lnk
+                except Exception:
+                    pass
+        except Exception as e:
+            log.warning(f"Erreur scan bureau pour raccourci SV : {e}")
+        return None
+
+    def _launch_sv_as_admin(lnk_path: str) -> bool:
+        """Launch the given .lnk with runas (admin) via ShellExecute. Returns True on success."""
+        try:
+            import ctypes
+            # ShellExecute with "runas" verb triggers UAC and runs as admin
+            ret = ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", lnk_path, None, None, 1  # SW_SHOWNORMAL
+            )
+            return int(ret) > 32  # >32 means success
+        except Exception as e:
+            log.error(f"ShellExecute runas échoué : {e}")
+            return False
+
+    def _wait_for_com(timeout: int = 60) -> bool:
+        """Wait up to  seconds for Access COM to become available."""
+        log.info(f"Attente du démarrage de Studio Vision (max {timeout}s)...")
+        for elapsed in range(timeout):
+            time.sleep(1)
+            try:
+                win32com.client.GetActiveObject("Access.Application")
+                log.info(f"COM Access disponible après ~{elapsed + 1}s.")
+                return True
+            except Exception:
+                pass
+        log.warning("COM Access non disponible après le délai imparti.")
+        return False
+
     # Detect backend DB and frontend path via COM (requires Access to be open)
     backend_mdb = get_db_path_from_com()
     if backend_mdb is None:
-        messagebox.showerror(
-            "Studio Vision introuvable",
-            "Pour terminer l'installation, suivez ces étapes :\n\n"
-            "  1. Ouvrez Studio Vision en tant qu'administrateur\n"
-            "     (clic droit sur le raccourci → Exécuter en tant qu'administrateur).\n\n"
-            "  2. Relancez le fichier  INSTALLATION_AUTOMATIQUE.bat\n"
-        )
-        sys.exit(1)
+        # Studio Vision not running — try to launch it as admin automatically
+        sv_lnk = _find_sv_shortcut_on_desktop()
+        if sv_lnk:
+            messagebox.showinfo(
+                "Lancement de Studio Vision",
+                "Studio Vision n'est pas ouvert.\n\n"
+                "Il va être lancé automatiquement en mode administrateur.\n"
+                "Veuillez accepter la demande d'élévation (UAC) si elle apparaît."
+            )
+            launched = _launch_sv_as_admin(sv_lnk)
+            if launched:
+                com_ready = _wait_for_com(timeout=60)
+                if com_ready:
+                    backend_mdb = get_db_path_from_com()
+                    if backend_mdb is None:
+                        messagebox.showerror(
+                            "Base de données introuvable",
+                            "Studio Vision a démarré mais la base de données n'a pas pu être détectée.\n"
+                            "Vérifiez que Studio Vision est bien connecté au réseau, puis relancez l'installation."
+                        )
+                        sys.exit(1)
+                else:
+                    messagebox.showerror(
+                        "Délai dépassé",
+                        "Studio Vision n'a pas répondu dans les 60 secondes.\n"
+                        "Vérifiez que Studio Vision se lance correctement, puis relancez l'installation."
+                    )
+                    sys.exit(1)
+            else:
+                messagebox.showerror(
+                    "Lancement échoué",
+                    "Impossible de lancer Studio Vision automatiquement.\n\n"
+                    "Veuillez l'ouvrir manuellement en tant qu'administrateur\n"
+                    "(clic droit sur le raccourci → Exécuter en tant qu'administrateur),\n"
+                    "puis relancez INSTALLATION_AUTOMATIQUE.bat."
+                )
+                sys.exit(1)
+        else:
+            messagebox.showerror(
+                "Raccourci Studio Vision introuvable",
+                "Studio Vision n'est pas ouvert et son raccourci n'a pas été trouvé sur le Bureau.\n\n"
+                "Veuillez l'ouvrir manuellement en tant qu'administrateur\n"
+                "(clic droit sur le raccourci → Exécuter en tant qu'administrateur),\n"
+                "puis relancez INSTALLATION_AUTOMATIQUE.bat."
+            )
+            sys.exit(1)
 
     frontend_path = None
     try:
