@@ -341,13 +341,17 @@ def configurer_via_interface(config_path: Path) -> None:
     messagebox.showinfo(
         "Installation terminée !",
         "Installation terminée avec succès !\n\n"
-        "ACTION REQUISE :\n"
-        "Veuillez maintenant FERMER la fenêtre Studio Vision\n"
-        "actuellement ouverte.\n\n"
+        "Studio Vision va être fermé automatiquement.\n"
         "Pour travailler, utilisez désormais uniquement\n"
         "le raccourci  'Studio Vision - Connected'\n"
         "créé sur votre Bureau."
     )
+    # Close Studio Vision (MSACCESS.EXE) automatically — no manual step needed
+    try:
+        subprocess.run(["taskkill", "/F", "/IM", "MSACCESS.EXE"], capture_output=True, timeout=10)
+        log.info("Studio Vision (MSACCESS.EXE) fermé automatiquement en fin d'installation.")
+    except Exception as e:
+        log.warning(f"Impossible de fermer MSACCESS.EXE automatiquement : {e}")
     root.destroy()
     # os._exit bypasses sys.exit (which Tkinter can intercept)
     os._exit(0)
